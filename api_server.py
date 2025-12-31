@@ -26,6 +26,31 @@ def safe_float(value, default=0.0):
     except (ValueError, TypeError):
         return default
 
+def slice_to_effective_window(series_or_df, start_date, end_date):
+    """
+    Slice a Series or DataFrame to the effective window (start_date to end_date inclusive).
+    
+    This is a pure filtering helper - no math, just date alignment.
+    Ensures all metrics use the same date window for consistency.
+    
+    Args:
+        series_or_df: pandas Series or DataFrame with DatetimeIndex
+        start_date: start date (inclusive)
+        end_date: end date (inclusive)
+    
+    Returns:
+        Sliced Series or DataFrame
+    """
+    if series_or_df.empty:
+        return series_or_df
+    
+    if start_date is None or end_date is None:
+        return series_or_df
+    
+    # Slice to the effective window
+    mask = (series_or_df.index >= start_date) & (series_or_df.index <= end_date)
+    return series_or_df.loc[mask]
+
 from portfolio_tool.data_io import load_portfolio
 from portfolio_tool.market_data import get_price_history, get_sector_info, get_risk_free_rate
 from portfolio_tool.analytics import (
@@ -41,6 +66,7 @@ from portfolio_tool.analytics import (
     compute_volatility,
     compute_sharpe_ratio,
     compute_sortino_ratio,
+    compute_beta,
     compute_max_drawdown,
     compute_ulcer_index,
     compute_drawdown_series,
@@ -52,6 +78,8 @@ from portfolio_tool.analytics import (
     get_as_of_date,
     compute_ytd_risk_contribution,
     MIN_OBS_CALMAR,
+    MIN_OBS_SHARPE,
+    MIN_OBS_SORTINO,
 )
 
 app = FastAPI(
@@ -185,17 +213,42 @@ async def analyze_portfolio(request: PortfolioRequest):
         if not prices_benchmark.empty and effective_start_date is not None:
             prices_benchmark = prices_benchmark[prices_benchmark.index >= effective_start_date]
         
+        # Slice prices to effective window (effective_start_date to actual_end_date)
+        # This is the SINGLE source of truth for all metrics
+        prices_portfolio_windowed = slice_to_effective_window(prices_portfolio, effective_start_date, actual_end_date)
+        prices_benchmark_windowed = slice_to_effective_window(prices_benchmark, effective_start_date, actual_end_date)
+        
+        # Calculate actual period length in years for proper annualization
+        if not prices_portfolio_windowed.empty:
+            actual_period_years = (actual_end_date - effective_start_date).days / 365.25
+        elif not prices_benchmark_windowed.empty:
+            actual_period_years = (actual_end_date - effective_start_date).days / 365.25
+        else:
+            actual_period_years = None
+        
+        # Round up to nearest integer for DateOffset (which requires integers)
+        # This ensures all windowed data is included when functions do lookback
+        # The actual float value is still used for precise annualization calculations where possible
+        actual_period_years_int = int(np.ceil(actual_period_years)) if actual_period_years else None
+        
         # Get risk-free rate
         risk_free_rate = get_risk_free_rate('^TNX')
         if risk_free_rate is None:
             risk_free_rate = 0.02  # Default 2%
         
-        # Compute yearly returns for returns table
+        # Compute daily returns and cumulative index ONCE using the windowed prices
+        # These will be used for ALL metrics to ensure consistency
+        portfolio_daily_windowed = compute_daily_returns(prices_portfolio_windowed, weights=weights)
+        benchmark_daily_windowed = compute_daily_returns(prices_benchmark_windowed, weights=None)
+        portfolio_cum_windowed = compute_cumulative_index(prices_portfolio_windowed, weights=weights)
+        benchmark_cum_windowed = compute_cumulative_index(prices_benchmark_windowed, weights=None)
+        
+        # Compute yearly returns for returns table using windowed prices
         ticker_returns, portfolio_returns = compute_returns(
-            prices_portfolio, weights=weights, years_back=6
+            prices_portfolio_windowed, weights=weights, years_back=6
         )
         bench_ticker_returns, _ = compute_returns(
-            prices_benchmark, weights=None, years_back=6
+            prices_benchmark_windowed, weights=None, years_back=6
         )
         benchmark_returns = bench_ticker_returns[benchmark_ticker]
         
@@ -220,9 +273,9 @@ async def analyze_portfolio(request: PortfolioRequest):
                 "benchmarkReturn": bench_ret
             })
         
-        # Compute period returns (1M, 3M, YTD, 1Y, 3Y, 5Y)
-        portfolio_period = compute_period_returns(prices_portfolio, weights=weights)
-        benchmark_period = compute_period_returns(prices_benchmark, weights=None)
+        # Compute period returns (1M, 3M, YTD, 1Y, 3Y, 5Y) using windowed prices
+        portfolio_period = compute_period_returns(prices_portfolio_windowed, weights=weights)
+        benchmark_period = compute_period_returns(prices_benchmark_windowed, weights=None)
         
         # Map period returns - preserve None values for periods with insufficient history
         # None values indicate that the portfolio doesn't have enough history for that period
@@ -252,17 +305,9 @@ async def analyze_portfolio(request: PortfolioRequest):
             '5Y': safe_float_or_none(benchmark_period.get('5Y')),
         }
         
-        # Compute risk metrics (using 3Y period for volatility, max drawdown, and ulcer index)
-        risk_metrics_df = compute_risk_metrics(
-            portfolio_prices=prices_portfolio,
-            benchmark_prices=prices_benchmark,
-            portfolio_weights=weights,
-            periods=[1, 3, 5],
-            risk_free_rate=risk_free_rate
-        )
-        
-        # Extract 3Y risk metrics for volatility, max drawdown, beta, sharpe, sortino (always use 3Y)
-        # Initialize ratios as None - they will be set to None if insufficient data
+        # Compute risk metrics using the FULL effective window (not lookback periods)
+        # All risk metrics now use the same window: effective_start_date to actual_end_date
+        # Calculate actual period length for proper annualization
         risk_metrics = {
             'annualVolatility': 0.0,
             'sharpeRatio': None,
@@ -272,47 +317,49 @@ async def analyze_portfolio(request: PortfolioRequest):
             'maxDrawdown': 0.0,
         }
         
-        # Always use 3Y for volatility, max drawdown, sharpe, sortino, and beta (for Risk section)
-        if '3Y' in risk_metrics_df.columns:
-            if 'Volatility' in risk_metrics_df.index:
-                vol_value = risk_metrics_df.loc['Volatility', '3Y']
-                risk_metrics['annualVolatility'] = safe_float(vol_value)
-            if 'Max Drawdown' in risk_metrics_df.index:
-                max_dd_value = risk_metrics_df.loc['Max Drawdown', '3Y']
-                risk_metrics['maxDrawdown'] = safe_float(max_dd_value)
-            if 'Sharpe Ratio' in risk_metrics_df.index:
-                sharpe_value = risk_metrics_df.loc['Sharpe Ratio', '3Y']
-                risk_metrics['sharpeRatio'] = safe_float_or_none(sharpe_value)
-            if 'Sortino Ratio' in risk_metrics_df.index:
-                sortino_value = risk_metrics_df.loc['Sortino Ratio', '3Y']
-                risk_metrics['sortinoRatio'] = safe_float_or_none(sortino_value)
-            if 'Beta' in risk_metrics_df.index:
-                beta_value = risk_metrics_df.loc['Beta', '3Y']
-                risk_metrics['beta'] = safe_float(beta_value, default=1.0)
+        # Portfolio risk metrics using full effective window
+        # Use integer years for DateOffset compatibility, but functions will use all windowed data
+        if actual_period_years_int and actual_period_years_int > 0 and len(portfolio_daily_windowed) >= 20:
+            # Use windowed series - functions do lookback from end, which will include all windowed data
+            vol = compute_volatility(portfolio_daily_windowed, years=actual_period_years_int)
+            risk_metrics['annualVolatility'] = safe_float(vol) if vol is not None else 0.0
         
-        # Calculate Calmar Ratio: CAGR (3Y) / |Max Drawdown (3Y)|
-        # Use 3Y CAGR from period returns and 3Y max drawdown
-        # Require sufficient data (at least 1 year of trading days) for reliable Calmar ratio
+        if actual_period_years_int and actual_period_years_int > 0 and len(portfolio_daily_windowed) >= MIN_OBS_SHARPE:
+            sharpe = compute_sharpe_ratio(portfolio_daily_windowed, years=actual_period_years_int, risk_free_rate=risk_free_rate)
+            risk_metrics['sharpeRatio'] = safe_float_or_none(sharpe)
+        
+        if actual_period_years_int and actual_period_years_int > 0 and len(portfolio_daily_windowed) >= MIN_OBS_SORTINO:
+            sortino = compute_sortino_ratio(portfolio_daily_windowed, years=actual_period_years_int, risk_free_rate=risk_free_rate)
+            risk_metrics['sortinoRatio'] = safe_float_or_none(sortino)
+        
+        if len(portfolio_daily_windowed) >= 20 and len(benchmark_daily_windowed) >= 20:
+            beta = compute_beta(portfolio_daily_windowed, benchmark_daily_windowed, years=actual_period_years_int if actual_period_years_int else 1)
+            risk_metrics['beta'] = safe_float(beta, default=1.0) if beta is not None else 1.0
+        
+        if len(portfolio_cum_windowed) >= 20:
+            max_dd = compute_max_drawdown(portfolio_cum_windowed, years=actual_period_years_int if actual_period_years_int else 1)
+            risk_metrics['maxDrawdown'] = safe_float(max_dd) if max_dd is not None else 0.0
+        
+        # Calculate Calmar Ratio: CAGR / |Max Drawdown| using full effective window
+        # Find the longest available CAGR period that matches our window
         calmar_ratio = None
-        if period_returns_portfolio.get('3Y') is not None:
-            # Compute portfolio daily returns for data sufficiency check
-            portfolio_daily_for_calmar = compute_daily_returns(prices_portfolio, weights=weights)
-            # Check if we have enough daily return observations in the 3Y period (1 year ≈ 252 trading days minimum)
-            cutoff_date_3y = portfolio_daily_for_calmar.index[-1] - pd.DateOffset(years=3)
-            period_daily_returns = portfolio_daily_for_calmar[portfolio_daily_for_calmar.index >= cutoff_date_3y]
-            if len(period_daily_returns) >= MIN_OBS_CALMAR:
-                cagr_3y = period_returns_portfolio['3Y']
+        if actual_period_years and actual_period_years >= 1.0:
+            # Determine which CAGR period to use (prefer longest available that matches our window)
+            cagr_value = None
+            if period_returns_portfolio.get('5Y') is not None and actual_period_years >= 4.75:
+                cagr_value = period_returns_portfolio['5Y']
+            elif period_returns_portfolio.get('3Y') is not None and actual_period_years >= 2.85:
+                cagr_value = period_returns_portfolio['3Y']
+            elif period_returns_portfolio.get('1Y') is not None and actual_period_years >= 0.95:
+                cagr_value = period_returns_portfolio['1Y']
+            
+            if cagr_value is not None and len(portfolio_daily_windowed) >= MIN_OBS_CALMAR:
                 max_dd_abs = abs(risk_metrics['maxDrawdown']) if risk_metrics['maxDrawdown'] is not None else 0
                 if max_dd_abs > 0 and not pd.isna(max_dd_abs):
-                    calmar_ratio = safe_float(cagr_3y / max_dd_abs)
+                    calmar_ratio = safe_float(cagr_value / max_dd_abs)
         risk_metrics['calmarRatio'] = calmar_ratio
         
-        # Compute benchmark risk metrics (using 3Y period to match portfolio metrics)
-        benchmark_daily = compute_daily_returns(prices_benchmark, weights=None)
-        benchmark_cum = compute_cumulative_index(prices_benchmark, weights=None)
-        
-        # Benchmark risk metrics (3Y period)
-        # Initialize ratios as None - they will be set to None if insufficient data
+        # Benchmark risk metrics using full effective window
         benchmark_risk_metrics = {
             'annualVolatility': 0.0,
             'sharpeRatio': None,
@@ -322,108 +369,97 @@ async def analyze_portfolio(request: PortfolioRequest):
             'beta': 1.0,  # Benchmark beta is always 1.0 (beta against itself)
         }
         
-        # Benchmark volatility (3Y)
-        bench_vol = compute_volatility(benchmark_daily, years=3)
-        benchmark_risk_metrics['annualVolatility'] = safe_float(bench_vol)
+        if actual_period_years_int and actual_period_years_int > 0 and len(benchmark_daily_windowed) >= 20:
+            bench_vol = compute_volatility(benchmark_daily_windowed, years=actual_period_years_int)
+            benchmark_risk_metrics['annualVolatility'] = safe_float(bench_vol) if bench_vol is not None else 0.0
         
-        # Benchmark Sharpe ratio (3Y)
-        bench_sharpe = compute_sharpe_ratio(benchmark_daily, years=3, risk_free_rate=risk_free_rate)
-        benchmark_risk_metrics['sharpeRatio'] = safe_float_or_none(bench_sharpe)
+        if actual_period_years_int and actual_period_years_int > 0 and len(benchmark_daily_windowed) >= MIN_OBS_SHARPE:
+            bench_sharpe = compute_sharpe_ratio(benchmark_daily_windowed, years=actual_period_years_int, risk_free_rate=risk_free_rate)
+            benchmark_risk_metrics['sharpeRatio'] = safe_float_or_none(bench_sharpe)
         
-        # Benchmark Sortino ratio (3Y)
-        bench_sortino = compute_sortino_ratio(benchmark_daily, years=3, risk_free_rate=risk_free_rate)
-        benchmark_risk_metrics['sortinoRatio'] = safe_float_or_none(bench_sortino)
+        if actual_period_years_int and actual_period_years_int > 0 and len(benchmark_daily_windowed) >= MIN_OBS_SORTINO:
+            bench_sortino = compute_sortino_ratio(benchmark_daily_windowed, years=actual_period_years_int, risk_free_rate=risk_free_rate)
+            benchmark_risk_metrics['sortinoRatio'] = safe_float_or_none(bench_sortino)
         
-        # Benchmark max drawdown (3Y)
-        bench_max_dd = compute_max_drawdown(benchmark_cum, years=3)
-        benchmark_risk_metrics['maxDrawdown'] = safe_float(bench_max_dd)
+        if len(benchmark_cum_windowed) >= 20:
+            bench_max_dd = compute_max_drawdown(benchmark_cum_windowed, years=actual_period_years_int if actual_period_years_int else 1)
+            benchmark_risk_metrics['maxDrawdown'] = safe_float(bench_max_dd) if bench_max_dd is not None else 0.0
         
-        # Benchmark beta is always 1.0 (beta of benchmark vs itself)
-        benchmark_risk_metrics['beta'] = 1.0
-        
-        # Benchmark Calmar Ratio: CAGR (3Y) / |Max Drawdown (3Y)|
-        # Require sufficient data (at least 1 year of trading days) for reliable Calmar ratio
+        # Benchmark Calmar Ratio using full effective window
         bench_calmar_ratio = None
-        if period_returns_benchmark.get('3Y') is not None:
-            # Check if we have enough daily return observations in the 3Y period (1 year ≈ 252 trading days minimum)
-            cutoff_date_3y = benchmark_daily.index[-1] - pd.DateOffset(years=3)
-            period_bench_daily_returns = benchmark_daily[benchmark_daily.index >= cutoff_date_3y]
-            if len(period_bench_daily_returns) >= MIN_OBS_CALMAR:
-                bench_cagr_3y = period_returns_benchmark['3Y']
+        if actual_period_years and actual_period_years >= 1.0:
+            # Determine which CAGR period to use (prefer longest available that matches our window)
+            bench_cagr_value = None
+            if period_returns_benchmark.get('5Y') is not None and actual_period_years >= 4.75:
+                bench_cagr_value = period_returns_benchmark['5Y']
+            elif period_returns_benchmark.get('3Y') is not None and actual_period_years >= 2.85:
+                bench_cagr_value = period_returns_benchmark['3Y']
+            elif period_returns_benchmark.get('1Y') is not None and actual_period_years >= 0.95:
+                bench_cagr_value = period_returns_benchmark['1Y']
+            
+            if bench_cagr_value is not None and len(benchmark_daily_windowed) >= MIN_OBS_CALMAR:
                 bench_max_dd_abs = abs(benchmark_risk_metrics['maxDrawdown']) if benchmark_risk_metrics['maxDrawdown'] is not None else 0
                 if bench_max_dd_abs > 0 and not pd.isna(bench_max_dd_abs):
-                    bench_calmar_ratio = safe_float(bench_cagr_3y / bench_max_dd_abs)
+                    bench_calmar_ratio = safe_float(bench_cagr_value / bench_max_dd_abs)
         benchmark_risk_metrics['calmarRatio'] = bench_calmar_ratio
         
-        # Cumulative returns (growth of $1,000)
-        portfolio_cum = compute_cumulative_index(prices_portfolio, weights=weights)
-        benchmark_cum = compute_cumulative_index(prices_benchmark, weights=None)
+        # Cumulative returns (growth of $1,000) - using windowed series
+        # portfolio_cum_windowed and benchmark_cum_windowed already computed above
         
-        # Calculate 5Y cumulative return (from 60 months ago to actual_end_date)
-        # Use 60 months to match exactly with the CAGR calculation period
-        # Use actual_end_date for consistency (accounts for weekends, holidays, yfinance delays)
-        cutoff_date_5y = actual_end_date - pd.DateOffset(months=60)
-        portfolio_cum_5y = portfolio_cum[portfolio_cum.index >= cutoff_date_5y]
-        benchmark_cum_5y = benchmark_cum[benchmark_cum.index >= cutoff_date_5y]
+        # Calculate cumulative return using the full effective window
+        # This matches the window used for all other metrics
+        cumulative_return_portfolio = 0.0
+        cumulative_return_benchmark = 0.0
         
-        cumulative_return_5y_portfolio = 0.0
-        cumulative_return_5y_benchmark = 0.0
-        
-        if len(portfolio_cum_5y) > 0 and len(benchmark_cum_5y) > 0:
-            # Get starting and ending values for 5Y period
-            portfolio_start_5y = portfolio_cum_5y.iloc[0]
-            portfolio_end_5y = portfolio_cum_5y.iloc[-1]
-            benchmark_start_5y = benchmark_cum_5y.iloc[0]
-            benchmark_end_5y = benchmark_cum_5y.iloc[-1]
+        if len(portfolio_cum_windowed) > 0 and len(benchmark_cum_windowed) > 0:
+            # Get starting and ending values for the effective window
+            portfolio_start = portfolio_cum_windowed.iloc[0]
+            portfolio_end = portfolio_cum_windowed.iloc[-1]
+            benchmark_start = benchmark_cum_windowed.iloc[0]
+            benchmark_end = benchmark_cum_windowed.iloc[-1]
             
             # Calculate cumulative return: (end / start - 1) * 100
-            if portfolio_start_5y > 0:
-                cumulative_return_5y_portfolio = safe_float(((portfolio_end_5y / portfolio_start_5y) - 1) * 100)
-            if benchmark_start_5y > 0:
-                cumulative_return_5y_benchmark = safe_float(((benchmark_end_5y / benchmark_start_5y) - 1) * 100)
+            if portfolio_start > 0:
+                cumulative_return_portfolio = safe_float(((portfolio_end / portfolio_start) - 1) * 100)
+            if benchmark_start > 0:
+                cumulative_return_benchmark = safe_float(((benchmark_end / benchmark_start) - 1) * 100)
         
-        # Extract 5Y metrics for Performance Metrics table (after cumulative indices are computed)
+        # For backward compatibility, also calculate 5Y cumulative return if we have 5+ years
+        # But use the windowed series, not a separate lookback
+        cumulative_return_5y_portfolio = cumulative_return_portfolio
+        cumulative_return_5y_benchmark = cumulative_return_benchmark
+        if actual_period_years and actual_period_years >= 4.75:
+            # If we have 5+ years, the cumulative return already represents the full period
+            # For display purposes, we can still call it "5Y" if the period is close to 5 years
+            pass
+        
+        # Extract 5Y metrics for Performance Metrics table (using windowed series)
+        # Note: These use the full effective window, not a fixed 5Y lookback
         performance_metrics_5y = {
             'cumulativeReturn5Y': cumulative_return_5y_portfolio,
             'cumulativeReturn5YBenchmark': cumulative_return_5y_benchmark,
             'cagr5Y': period_returns_portfolio.get('5Y', 0.0),
             'cagr5YBenchmark': period_returns_benchmark.get('5Y', 0.0),
-            'maxDrawdown5Y': 0.0,
-            'maxDrawdown5YBenchmark': 0.0,
-            'sharpeRatio5Y': 0.0,
-            'sharpeRatio5YBenchmark': 0.0,
+            'maxDrawdown5Y': risk_metrics['maxDrawdown'],  # Use the windowed max drawdown
+            'maxDrawdown5YBenchmark': benchmark_risk_metrics['maxDrawdown'],  # Use the windowed max drawdown
+            'sharpeRatio5Y': risk_metrics['sharpeRatio'] if risk_metrics['sharpeRatio'] is not None else 0.0,
+            'sharpeRatio5YBenchmark': benchmark_risk_metrics['sharpeRatio'] if benchmark_risk_metrics['sharpeRatio'] is not None else 0.0,
         }
         
-        # Extract 5Y max drawdown and Sharpe ratio from risk_metrics_df
-        if '5Y' in risk_metrics_df.columns:
-            if 'Max Drawdown' in risk_metrics_df.index:
-                max_dd_5y = risk_metrics_df.loc['Max Drawdown', '5Y']
-                performance_metrics_5y['maxDrawdown5Y'] = safe_float(max_dd_5y)
-            if 'Sharpe Ratio' in risk_metrics_df.index:
-                sharpe_5y = risk_metrics_df.loc['Sharpe Ratio', '5Y']
-                performance_metrics_5y['sharpeRatio5Y'] = safe_float(sharpe_5y)
-        
-        # Calculate benchmark 5Y max drawdown and Sharpe ratio
-        bench_max_dd_5y = compute_max_drawdown(benchmark_cum, years=5)
-        performance_metrics_5y['maxDrawdown5YBenchmark'] = safe_float(bench_max_dd_5y)
-        
-        bench_sharpe_5y = compute_sharpe_ratio(benchmark_daily, years=5, risk_free_rate=risk_free_rate)
-        performance_metrics_5y['sharpeRatio5YBenchmark'] = safe_float(bench_sharpe_5y)
-        
-        # Align indices and create growth of $1,000 data
+        # Align indices and create growth of $1,000 data using windowed series
         growth_of_100 = []
-        common_dates = portfolio_cum.index.intersection(benchmark_cum.index)
+        common_dates = portfolio_cum_windowed.index.intersection(benchmark_cum_windowed.index)
         
         for date in common_dates:
             growth_of_100.append({
                 'date': date.strftime('%Y-%m-%d'),
-                'portfolio': safe_float(portfolio_cum[date]),
-                'benchmark': safe_float(benchmark_cum[date])
+                'portfolio': safe_float(portfolio_cum_windowed[date]),
+                'benchmark': safe_float(benchmark_cum_windowed[date])
             })
         
-        # Drawdown series (portfolio vs benchmark)
-        portfolio_drawdown = compute_drawdown_series(portfolio_cum)
-        benchmark_drawdown = compute_drawdown_series(benchmark_cum)
+        # Drawdown series (portfolio vs benchmark) using windowed series
+        portfolio_drawdown = compute_drawdown_series(portfolio_cum_windowed)
+        benchmark_drawdown = compute_drawdown_series(benchmark_cum_windowed)
         
         # Align drawdown series on common dates
         drawdown_common_dates = portfolio_drawdown.index.intersection(benchmark_drawdown.index)
@@ -435,12 +471,10 @@ async def analyze_portfolio(request: PortfolioRequest):
                 'benchmark': safe_float(benchmark_drawdown[date] * 100)  # Convert to percentage
             })
         
-        # Rolling Sharpe ratio (6-month window)
-        portfolio_daily = compute_daily_returns(prices_portfolio, weights=weights)
-        benchmark_daily = compute_daily_returns(prices_benchmark, weights=None)
-        
-        portfolio_rolling_sharpe = compute_rolling_sharpe_ratio(portfolio_daily, window_months=6, risk_free_rate=risk_free_rate)
-        benchmark_rolling_sharpe = compute_rolling_sharpe_ratio(benchmark_daily, window_months=6, risk_free_rate=risk_free_rate)
+        # Rolling Sharpe ratio (6-month window) using windowed series
+        # portfolio_daily_windowed and benchmark_daily_windowed already computed above
+        portfolio_rolling_sharpe = compute_rolling_sharpe_ratio(portfolio_daily_windowed, window_months=6, risk_free_rate=risk_free_rate)
+        benchmark_rolling_sharpe = compute_rolling_sharpe_ratio(benchmark_daily_windowed, window_months=6, risk_free_rate=risk_free_rate)
         
         # Align rolling Sharpe series on common dates
         # Filter out NaN values (periods before full window is available)
@@ -462,39 +496,10 @@ async def analyze_portfolio(request: PortfolioRequest):
                     # Skip invalid values
                     continue
         
-        # Rolling Volatility (6-month window, 126 trading days)
-        # Ensure both portfolio and benchmark use the same aligned date range for consistency
-        # This matches the alignment logic used in compute_rolling_beta
-        if not prices_portfolio.empty and not prices_benchmark.empty:
-            # Use the same alignment logic as rolling beta
-            common_end_date = min(prices_portfolio.index.max(), prices_benchmark.index.max())
-            cutoff_date = common_end_date - pd.DateOffset(months=60)
-            
-            # Filter both to same date range
-            portfolio_filtered = prices_portfolio[prices_portfolio.index >= cutoff_date].sort_index()
-            benchmark_filtered = prices_benchmark[prices_benchmark.index >= cutoff_date].sort_index()
-            
-            # Align on common dates (inner join) to ensure both start on the same date
-            # This matches the logic used in compute_rolling_beta
-            aligned_prices = pd.concat([portfolio_filtered, benchmark_filtered], axis=1, join='inner')
-            aligned_prices = aligned_prices.dropna(how='any')  # Remove any rows with missing data
-            
-            if len(aligned_prices) > 0:
-                # Split back into portfolio and benchmark, now with aligned dates
-                portfolio_cols = [col for col in portfolio_filtered.columns if col in aligned_prices.columns]
-                benchmark_cols = [col for col in benchmark_filtered.columns if col in aligned_prices.columns]
-                
-                prices_portfolio_aligned = aligned_prices[portfolio_cols] if portfolio_cols else pd.DataFrame()
-                prices_benchmark_aligned = aligned_prices[benchmark_cols] if benchmark_cols else pd.DataFrame()
-                
-                portfolio_rolling_vol = compute_rolling_volatility(prices_portfolio_aligned, weights=weights) if not prices_portfolio_aligned.empty else pd.Series(dtype=float)
-                benchmark_rolling_vol = compute_rolling_volatility(prices_benchmark_aligned, weights=None) if not prices_benchmark_aligned.empty else pd.Series(dtype=float)
-            else:
-                portfolio_rolling_vol = pd.Series(dtype=float)
-                benchmark_rolling_vol = pd.Series(dtype=float)
-        else:
-            portfolio_rolling_vol = compute_rolling_volatility(prices_portfolio, weights=weights) if not prices_portfolio.empty else pd.Series(dtype=float)
-            benchmark_rolling_vol = compute_rolling_volatility(prices_benchmark, weights=None) if not prices_benchmark.empty else pd.Series(dtype=float)
+        # Rolling Volatility (6-month window, 126 trading days) using windowed prices
+        # Use the windowed prices which already have the effective window applied
+        portfolio_rolling_vol = compute_rolling_volatility(prices_portfolio_windowed, weights=weights) if not prices_portfolio_windowed.empty else pd.Series(dtype=float)
+        benchmark_rolling_vol = compute_rolling_volatility(prices_benchmark_windowed, weights=None) if not prices_benchmark_windowed.empty else pd.Series(dtype=float)
         
         # Verify rolling volatility series end dates match common_end_date (if sufficient data exists)
         # Note: Rolling series may end earlier if insufficient data for full window
@@ -526,8 +531,8 @@ async def analyze_portfolio(request: PortfolioRequest):
                     # Skip invalid values
                     continue
         
-        # Rolling Beta (6-month window, 126 trading days) vs SPY
-        rolling_beta_series = compute_rolling_beta(prices_portfolio, prices_benchmark, portfolio_weights=weights, window_days=126)
+        # Rolling Beta (6-month window, 126 trading days) vs SPY using windowed prices
+        rolling_beta_series = compute_rolling_beta(prices_portfolio_windowed, prices_benchmark_windowed, portfolio_weights=weights, window_days=126)
         
         # Verify rolling beta series end date matches actual_end_date (if sufficient data exists)
         # Note: Rolling series may end earlier if insufficient data for full window
@@ -552,11 +557,11 @@ async def analyze_portfolio(request: PortfolioRequest):
                     # Skip invalid values
                     continue
         
-        # YTD contributions to return
+        # YTD contributions to return using windowed prices
         ytd_contributions_list = []
         try:
             from portfolio_tool.analytics import is_cash_ticker
-            ytd_contributions = compute_ytd_contribution(prices_portfolio, weights=weights)
+            ytd_contributions = compute_ytd_contribution(prices_portfolio_windowed, weights=weights)
             # Filter out cash tickers from visualization
             for ticker, contribution in ytd_contributions.items():
                 if not pd.isna(contribution) and not is_cash_ticker(ticker):
@@ -569,11 +574,11 @@ async def analyze_portfolio(request: PortfolioRequest):
             # This can happen if the current year just started or if there's insufficient data
             ytd_contributions_list = []
         
-        # YTD risk contributions (percentage of total portfolio risk)
+        # YTD risk contributions (percentage of total portfolio risk) using windowed prices
         ytd_risk_contributions_list = []
         try:
             from portfolio_tool.analytics import is_cash_ticker
-            ytd_risk_contributions = compute_ytd_risk_contribution(prices_portfolio, weights=weights)
+            ytd_risk_contributions = compute_ytd_risk_contribution(prices_portfolio_windowed, weights=weights)
             # Filter out cash tickers from visualization
             for ticker, contribution in ytd_risk_contributions.items():
                 if not pd.isna(contribution) and not is_cash_ticker(ticker):
@@ -591,9 +596,10 @@ async def analyze_portfolio(request: PortfolioRequest):
             # If no YTD data is available, return empty list
             ytd_risk_contributions_list = []
         
-        # Monthly returns heatmap (last 5 years)
+        # Monthly returns heatmap using windowed prices
+        # years_back parameter is used for display filtering, but data comes from windowed prices
         monthly_portfolio = compute_monthly_portfolio_returns(
-            prices_portfolio, weights=weights, years_back=5
+            prices_portfolio_windowed, weights=weights, years_back=5
         )
         
         # Format monthly returns heatmap
@@ -612,8 +618,9 @@ async def analyze_portfolio(request: PortfolioRequest):
                             'return': safe_float(return_val)
                         })
         
-        # Correlation matrix
-        correlation_matrix = compute_correlation_matrix(prices_portfolio, years=3)
+        # Correlation matrix using windowed prices
+        # years parameter is ignored since we're using windowed prices, but kept for function signature
+        correlation_matrix = compute_correlation_matrix(prices_portfolio_windowed, years=None)
         
         # Risk-return scatter
         benchmark_tickers = ['SPY', 'QQQ', 'AGG', 'ACWI']
@@ -622,9 +629,10 @@ async def analyze_portfolio(request: PortfolioRequest):
         
         risk_return_scatter = []
         
-        # Portfolio
+        # Portfolio using windowed prices
+        # years parameter uses integer for DateOffset compatibility
         port_ret, port_vol = compute_annualized_return_and_volatility(
-            prices_portfolio, weights=weights, years=5
+            prices_portfolio_windowed, weights=weights, years=actual_period_years_int if actual_period_years_int else 5
         )
         if port_ret is not None and port_vol is not None:
             risk_return_scatter.append({
@@ -633,9 +641,9 @@ async def analyze_portfolio(request: PortfolioRequest):
                 'risk': safe_float(port_vol)
             })
         
-        # SPY
+        # SPY using windowed prices
         spy_ret, spy_vol = compute_annualized_return_and_volatility(
-            prices_benchmark, weights=None, years=5
+            prices_benchmark_windowed, weights=None, years=actual_period_years_int if actual_period_years_int else 5
         )
         if spy_ret is not None and spy_vol is not None:
             risk_return_scatter.append({
@@ -650,11 +658,10 @@ async def analyze_portfolio(request: PortfolioRequest):
                 continue
             if ticker in benchmark_prices_all.columns:
                 ticker_prices = benchmark_prices_all[[ticker]]
-                # Filter to effective_start_date for consistency with portfolio and SPY
-                if effective_start_date is not None:
-                    ticker_prices = ticker_prices[ticker_prices.index >= effective_start_date]
+                # Slice to effective window for consistency with portfolio and SPY
+                ticker_prices_windowed = slice_to_effective_window(ticker_prices, effective_start_date, actual_end_date)
                 ticker_ret, ticker_vol = compute_annualized_return_and_volatility(
-                    ticker_prices, weights=None, years=5
+                    ticker_prices_windowed, weights=None, years=actual_period_years_int if actual_period_years_int else 5
                 )
                 if ticker_ret is not None and ticker_vol is not None:
                     risk_return_scatter.append({
@@ -663,17 +670,19 @@ async def analyze_portfolio(request: PortfolioRequest):
                         'risk': safe_float(ticker_vol)
                     })
         
-        # Efficient frontier
-        benchmark_prices_dict = {benchmark_ticker: prices_benchmark}
+        # Efficient frontier using windowed prices
+        benchmark_prices_dict = {benchmark_ticker: prices_benchmark_windowed}
         for ticker in benchmark_tickers:
             if ticker in benchmark_prices_all.columns:
-                benchmark_prices_dict[ticker] = benchmark_prices_all[[ticker]]
+                ticker_prices = benchmark_prices_all[[ticker]]
+                ticker_prices_windowed = slice_to_effective_window(ticker_prices, effective_start_date, actual_end_date)
+                benchmark_prices_dict[ticker] = ticker_prices_windowed
         
         ef_data = compute_efficient_frontier_analysis(
-            portfolio_prices=prices_portfolio,
+            portfolio_prices=prices_portfolio_windowed,
             portfolio_weights=weights,
             benchmark_prices_dict=benchmark_prices_dict,
-            years=5
+            years=actual_period_years_int if actual_period_years_int else 5
         )
         
         # Format efficient frontier
@@ -731,6 +740,91 @@ async def analyze_portfolio(request: PortfolioRequest):
         if abs(total_weight - 1.0) > 0.05:  # 5% tolerance
             warnings.append(f'Portfolio weights sum to {total_weight*100:.1f}%, expected 100%')
         
+        # ===== CONSISTENCY CHECKS AND AUDIT LOG =====
+        audit_log = {
+            'effective_start_date': effective_start_date.strftime('%Y-%m-%d') if effective_start_date is not None else None,
+            'as_of_date': actual_end_date.strftime('%Y-%m-%d') if isinstance(actual_end_date, pd.Timestamp) else pd.Timestamp(actual_end_date).strftime('%Y-%m-%d'),
+            'actual_period_years': safe_float(actual_period_years) if actual_period_years else None,
+            'portfolio_daily_returns_rows': len(portfolio_daily_windowed),
+            'benchmark_daily_returns_rows': len(benchmark_daily_windowed),
+            'portfolio_cumulative_index_rows': len(portfolio_cum_windowed),
+            'benchmark_cumulative_index_rows': len(benchmark_cum_windowed),
+            'metrics': {}
+        }
+        
+        # Track date ranges used by each metric/chart
+        if len(portfolio_daily_windowed) > 0:
+            audit_log['metrics']['portfolio_daily_returns'] = {
+                'start': portfolio_daily_windowed.index[0].strftime('%Y-%m-%d'),
+                'end': portfolio_daily_windowed.index[-1].strftime('%Y-%m-%d'),
+                'rows': len(portfolio_daily_windowed)
+            }
+        
+        if len(benchmark_daily_windowed) > 0:
+            audit_log['metrics']['benchmark_daily_returns'] = {
+                'start': benchmark_daily_windowed.index[0].strftime('%Y-%m-%d'),
+                'end': benchmark_daily_windowed.index[-1].strftime('%Y-%m-%d'),
+                'rows': len(benchmark_daily_windowed)
+            }
+        
+        if len(portfolio_cum_windowed) > 0:
+            audit_log['metrics']['growth_of_100_chart'] = {
+                'start': portfolio_cum_windowed.index[0].strftime('%Y-%m-%d'),
+                'end': portfolio_cum_windowed.index[-1].strftime('%Y-%m-%d'),
+                'rows': len(portfolio_cum_windowed)
+            }
+        
+        if len(portfolio_drawdown) > 0:
+            audit_log['metrics']['drawdown_chart'] = {
+                'start': portfolio_drawdown.index[0].strftime('%Y-%m-%d'),
+                'end': portfolio_drawdown.index[-1].strftime('%Y-%m-%d'),
+                'rows': len(portfolio_drawdown)
+            }
+        
+        # Consistency assertions (warnings, not errors)
+        consistency_warnings = []
+        
+        # Check: cumulative return from Summary should equal (last value of growth chart / 1000 - 1)
+        if len(portfolio_cum_windowed) > 0 and len(growth_of_100) > 0:
+            growth_chart_final = growth_of_100[-1]['portfolio'] if growth_of_100 else None
+            if growth_chart_final is not None:
+                growth_chart_return = ((growth_chart_final / 1000.0) - 1) * 100
+                if abs(growth_chart_return - cumulative_return_portfolio) > 0.01:  # 0.01% tolerance
+                    consistency_warnings.append(
+                        f"INCONSISTENCY: Cumulative return ({cumulative_return_portfolio:.2f}%) != "
+                        f"Growth chart final value ({growth_chart_return:.2f}%)"
+                    )
+        
+        # Check: max drawdown stat should equal min drawdown from drawdown chart
+        if len(portfolio_drawdown) > 0 and risk_metrics['maxDrawdown'] is not None:
+            drawdown_chart_min = min([d['portfolio'] for d in drawdown_data]) if drawdown_data else None
+            if drawdown_chart_min is not None:
+                # drawdown_chart_min is already in percentage (multiplied by 100)
+                max_dd_stat = risk_metrics['maxDrawdown'] * 100  # Convert to percentage
+                if abs(drawdown_chart_min - max_dd_stat) > 0.01:  # 0.01% tolerance
+                    consistency_warnings.append(
+                        f"INCONSISTENCY: Max drawdown stat ({max_dd_stat:.2f}%) != "
+                        f"Min drawdown from chart ({drawdown_chart_min:.2f}%)"
+                    )
+        
+        # Check: YTD contribution bars should sum to YTD portfolio return
+        if len(ytd_contributions_list) > 0 and period_returns_portfolio.get('YTD') is not None:
+            ytd_contrib_sum = sum([c['contribution'] for c in ytd_contributions_list])
+            ytd_return_pct = period_returns_portfolio['YTD'] * 100  # Convert to percentage
+            if abs(ytd_contrib_sum - ytd_return_pct) > 0.1:  # 0.1% tolerance (accounting for rounding)
+                consistency_warnings.append(
+                    f"INCONSISTENCY: YTD contributions sum ({ytd_contrib_sum:.2f}%) != "
+                    f"YTD portfolio return ({ytd_return_pct:.2f}%)"
+                )
+        
+        # Add consistency warnings to audit log
+        if consistency_warnings:
+            audit_log['consistency_warnings'] = consistency_warnings
+            # Also add to main warnings for visibility
+            warnings.extend(consistency_warnings)
+        
+        # ===== END CONSISTENCY CHECKS =====
+        
         # Build response matching PortfolioDashboardResponse
         # Use actual_end_date (last date in data) instead of today for consistency with displayed end date
         response_data = {
@@ -771,7 +865,8 @@ async def analyze_portfolio(request: PortfolioRequest):
                 'efficientFrontier': efficient_frontier
             },
             'holdings': holdings,
-            'warnings': warnings
+            'warnings': warnings,
+            'auditLog': audit_log  # Temporary audit log for debugging consistency
         }
         
         return {
