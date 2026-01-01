@@ -291,6 +291,150 @@ def compute_period_returns(prices, weights=None):
 
     return results
 
+
+def compute_period_returns_vs_benchmark(prices, weights=None):
+    """
+    Compute fixed-horizon period returns (1M, 3M, YTD, 1Y, 3Y, 5Y) for Period Returns vs Benchmark table.
+    
+    This function is SEPARATE from the main dashboard logic. It uses the FULL available data
+    (not windowed to user-selected analysis window) and computes fixed-horizon buckets.
+    
+    Key differences from compute_period_returns():
+    - Uses FULL prices (not windowed to effective_start_date)
+    - Independent of user-selected analysis window
+    - Fixed-horizon buckets (1M, 3M, YTD, 1Y, 3Y, 5Y)
+    - More strict insufficient data logic with calendar coverage checks
+    
+    Insufficient data requirements:
+    - 1M/3M/YTD: require at least 20 trading days inside the bucket
+    - 1Y: require at least ~240 trading days AND at least 0.95 years of calendar coverage
+    - 3Y: require at least 2.85 years (95% of 3Y) AND sufficient trading days (>= 252*2.85)
+    - 5Y: require at least 4.75 years (95% of 5Y) of calendar coverage
+    
+    Calendar coverage check: For each bucket [bucket_start, bucket_end], we check if we have
+    sufficient data. The actual coverage is from max(bucket_start, bucket_start_available) to bucket_end.
+    actual_years = (bucket_end - max(bucket_start, bucket_start_available)).days / 365.25
+    This checks coverage within the bucket window itself, not the user-selected analysis window.
+    
+    Args:
+        prices: DataFrame of daily prices (index = dates, columns = tickers)
+                Should be FULL prices (not windowed to effective_start_date)
+        weights: optional dict/Series of ticker -> weight for portfolio
+    
+    Returns:
+        dict: {period: return_value or None} where None indicates insufficient data
+              Returns are as decimals (0.05 = 5%)
+              For 3Y and 5Y, returns are annualized (CAGR)
+              For 1M, 3M, YTD, 1Y, returns are total period returns (not annualized)
+    """
+    prices = prices.sort_index()
+    
+    if len(prices) == 0:
+        return {}
+    
+    # Compute daily returns
+    daily_returns = prices.pct_change().dropna()
+    
+    if len(daily_returns) == 0:
+        return {}
+    
+    # Get as_of_date (bucket_end) from the full dataset
+    bucket_end = get_as_of_date(daily_returns.index)
+    
+    # Get the first available date in the dataset (bucket_start_available)
+    bucket_start_available = daily_returns.index[0]
+    
+    periods = {
+        '1M': 1,
+        '3M': 3,
+        'YTD': None,
+        '1Y': 12,
+        '3Y': 36,
+        '5Y': 60
+    }
+    
+    results = {}
+    
+    for label, months in periods.items():
+        # Determine the bucket window [bucket_start, bucket_end]
+        if label == 'YTD':
+            bucket_start = pd.Timestamp(bucket_end.year, 1, 1)
+        elif label in ['3Y', '5Y']:
+            years = int(label[0])
+            bucket_start = bucket_end - pd.DateOffset(years=years)
+        else:
+            bucket_start = bucket_end - pd.DateOffset(months=months)
+        
+        # Check calendar coverage: actual_years = (bucket_end - bucket_start_available).days / 365.25
+        # We need bucket_start_available <= bucket_start for full coverage
+        # The actual coverage is from max(bucket_start, bucket_start_available) to bucket_end
+        actual_bucket_start = max(bucket_start, bucket_start_available)
+        actual_years = (bucket_end - actual_bucket_start).days / 365.25
+        
+        # Filter returns to the bucket window
+        period_returns = daily_returns.loc[
+            (daily_returns.index >= actual_bucket_start) & 
+            (daily_returns.index <= bucket_end)
+        ]
+        
+        n_trading_days = len(period_returns)
+        
+        # Insufficient data checks
+        if label in ['1M', '3M', 'YTD']:
+            # Require at least 20 trading days
+            if n_trading_days < 20:
+                results[label] = None
+                continue
+        
+        elif label == '1Y':
+            # Require at least ~240 trading days AND at least 0.95 years of calendar coverage
+            required_years = 0.95
+            if n_trading_days < 240 or actual_years < required_years:
+                results[label] = None
+                continue
+        
+        elif label == '3Y':
+            # Require at least 2.85 years (95% of 3Y) AND sufficient trading days (>= 252*2.85)
+            required_years = 2.85
+            required_trading_days = int(252 * 2.85)  # ~718 trading days
+            if actual_years < required_years or n_trading_days < required_trading_days:
+                results[label] = None
+                continue
+        
+        elif label == '5Y':
+            # Require at least 4.75 years (95% of 5Y) of calendar coverage
+            required_years = 4.75
+            if actual_years < required_years:
+                results[label] = None
+                continue
+        
+        # Build portfolio returns if weights provided
+        if weights is not None:
+            w = pd.Series(weights).reindex(period_returns.columns).fillna(0)
+            portfolio_daily = (period_returns * w).sum(axis=1)
+            returns_series = portfolio_daily
+        else:
+            # Assume single-column DF for benchmark
+            if period_returns.shape[1] == 1:
+                returns_series = period_returns.iloc[:, 0]
+            else:
+                w = pd.Series(1 / period_returns.shape[1], index=period_returns.columns)
+                returns_series = (period_returns * w).sum(axis=1)
+        
+        # Compound daily returns to get total return
+        total_return = (1 + returns_series).prod() - 1
+        
+        # For multi-year periods (3Y, 5Y), compute annualized return (CAGR)
+        if label in ['3Y', '5Y']:
+            years = int(label[0])
+            cagr = (1 + total_return) ** (1 / years) - 1
+            results[label] = float(cagr)
+        else:
+            # For shorter periods, return total period return (not annualized)
+            results[label] = float(total_return)
+    
+    return results
+
 # Adding cumulative returns plot
 def compute_cumulative_index(prices, weights=None):
     """

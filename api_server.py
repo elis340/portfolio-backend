@@ -220,6 +220,7 @@ from portfolio_tool.market_data import get_price_history, get_sector_info, get_r
 from portfolio_tool.analytics import (
     compute_returns,
     compute_period_returns,
+    compute_period_returns_vs_benchmark,
     compute_cumulative_index,
     compute_monthly_portfolio_returns,
     compute_risk_metrics,
@@ -472,12 +473,21 @@ async def analyze_portfolio(request: PortfolioRequest):
                 "benchmarkReturn": bench_ret
             })
         
-        # Compute period returns (1M, 3M, YTD, 1Y, 3Y, 5Y) using windowed prices
-        portfolio_period = compute_period_returns(prices_portfolio_windowed, weights=weights)
-        benchmark_period = compute_period_returns(prices_benchmark_windowed, weights=None)
+        # Compute Period Returns vs Benchmark (1M, 3M, YTD, 1Y, 3Y, 5Y)
+        # IMPORTANT: This is SEPARATE from dashboard logic. Uses FULL prices (not windowed) and
+        # fixed-horizon buckets independent of the user-selected analysis window.
+        # Dashboard stat cards should NOT source from this table - they use windowed data.
+        # Handle empty portfolio case (100% cash)
+        if prices_portfolio.empty:
+            # For 100% cash portfolio, use empty DataFrame (will return empty dict)
+            portfolio_period = compute_period_returns_vs_benchmark(pd.DataFrame(), weights=weights)
+        else:
+            portfolio_period = compute_period_returns_vs_benchmark(prices_portfolio, weights=weights)
+        
+        benchmark_period = compute_period_returns_vs_benchmark(prices_benchmark, weights=None)
         
         # Map period returns - preserve None values for periods with insufficient history
-        # None values indicate that the portfolio doesn't have enough history for that period
+        # None values indicate insufficient data for that period (frontend shows "—" with tooltip)
         def safe_float_or_none(value):
             """Convert to float if valid, preserve None if value is None or NaN."""
             if value is None:
