@@ -65,15 +65,11 @@ logs/
 .Spotlight-V100
 .Trashes
 ehthumbs.db
-Thumbs.db
-
-# Data files (keep structure, ignore actual data)
+Thumbs.db# Data files (keep structure, ignore actual data)
 *.csv
 *.xlsx
 *.xls
-!example_portfolio.csv
-
-# Temporary files
+!example_portfolio.csv# Temporary files
 *.tmp
 *.temp
 .cache/
