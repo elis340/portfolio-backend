@@ -942,6 +942,21 @@ async def analyze_portfolio(request: PortfolioRequest):
                     'risk': safe_float(tangency.get('vol', 0.0)),
                     'return': safe_float(tangency.get('ret', 0.0))
                 }
+                
+                # Add optimal allocation weights if available
+                tangency_weights = ef_data.get('tangency_weights')
+                if tangency_weights is not None and len(tangency_weights) > 0:
+                    # Get asset tickers from the portfolio
+                    portfolio_tickers = list(weights.keys())
+                    if len(tangency_weights) == len(portfolio_tickers):
+                        target_allocation = []
+                        for i, ticker in enumerate(portfolio_tickers):
+                            target_allocation.append({
+                                'ticker': ticker,
+                                'currentWeight': safe_float(weights.get(ticker, 0) * 100),  # Current weight as percentage
+                                'targetWeight': safe_float(tangency_weights[i] * 100)  # Optimal weight as percentage
+                            })
+                        efficient_frontier['targetAllocation'] = target_allocation
             
             # Min variance - find point with lowest risk in frontier
             if efficient_frontier['points']:
