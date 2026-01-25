@@ -9,11 +9,22 @@ import warnings
 try:
     import pandas_datareader.data as web
     PANDAS_DATAREADER_AVAILABLE = True
-except ImportError:
+except ImportError as e:
     PANDAS_DATAREADER_AVAILABLE = False
+    import_error_msg = str(e)
     warnings.warn(
-        "pandas-datareader not available. Fama-French factor analysis will not work. "
-        "Install with: pip install pandas-datareader>=0.10.0"
+        f"pandas-datareader not available. Fama-French factor analysis will not work. "
+        f"Import error: {import_error_msg}. "
+        f"Install with: pip install pandas-datareader>=0.10.0"
+    )
+except Exception as e:
+    # Catch other potential errors (e.g., missing dependencies)
+    PANDAS_DATAREADER_AVAILABLE = False
+    import_error_msg = str(e)
+    warnings.warn(
+        f"pandas-datareader import failed. Fama-French factor analysis will not work. "
+        f"Error: {import_error_msg}. "
+        f"Install with: pip install pandas-datareader>=0.10.0"
     )
 
 
