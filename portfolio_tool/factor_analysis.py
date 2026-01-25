@@ -171,6 +171,19 @@ def _align_data(
     Raises:
         ValueError: If insufficient overlapping data
     """
+    # Strip timezone from both indices to avoid tz-naive/tz-aware mismatch
+    # Make copies to avoid modifying original data
+    ticker_returns = ticker_returns.copy()
+    factors = factors.copy()
+    
+    # Remove timezone from ticker_returns index if present
+    if hasattr(ticker_returns.index, 'tz') and ticker_returns.index.tz is not None:
+        ticker_returns.index = ticker_returns.index.tz_localize(None)
+    
+    # Remove timezone from factors index if present
+    if hasattr(factors.index, 'tz') and factors.index.tz is not None:
+        factors.index = factors.index.tz_localize(None)
+    
     # Create DataFrame from returns
     aligned = pd.DataFrame({'returns': ticker_returns})
     
@@ -179,6 +192,10 @@ def _align_data(
     
     # Add risk-free rate if provided
     if risk_free_rate is not None:
+        # Strip timezone from risk_free_rate index if present
+        risk_free_rate = risk_free_rate.copy()
+        if hasattr(risk_free_rate.index, 'tz') and risk_free_rate.index.tz is not None:
+            risk_free_rate.index = risk_free_rate.index.tz_localize(None)
         aligned['rf'] = risk_free_rate.reindex(aligned.index, method='ffill')
         aligned['excess_returns'] = aligned['returns'] - aligned['rf']
     elif 'RF' in aligned.columns:
