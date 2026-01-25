@@ -217,6 +217,7 @@ def compute_annualized_return_and_volatility_from_window(daily_returns, period_y
 
 from portfolio_tool.data_io import load_portfolio
 from portfolio_tool.market_data import get_price_history, get_sector_info, get_risk_free_rate
+from portfolio_tool.factor_analysis import analyze_factors
 from portfolio_tool.analytics import (
     compute_returns,
     compute_period_returns,
@@ -279,6 +280,15 @@ app.add_middleware(
 class PortfolioRequest(BaseModel):
     portfolioText: str
     requested_start_date: Optional[str] = None  # ISO format date string (YYYY-MM-DD)
+
+
+class FactorAnalysisRequest(BaseModel):
+    ticker: str
+    start_date: str  # ISO format date string (YYYY-MM-DD)
+    end_date: str  # ISO format date string (YYYY-MM-DD)
+    factor_model: str = "3-factor"  # Options: "3-factor", "5-factor", "4-factor", "CAPM"
+    frequency: str = "monthly"  # Options: "daily", "weekly", "monthly"
+    risk_free_rate: str = "1M_TBILL"  # Options: "1M_TBILL", "3M_TBILL"
 
 
 def parse_portfolio_text(portfolio_text: str) -> pd.DataFrame:
@@ -1142,6 +1152,153 @@ async def analyze_portfolio(request: PortfolioRequest):
         error_detail = str(e)
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Portfolio analysis error: {error_detail}")
+
+
+@app.post("/factors/analyze")
+async def analyze_factors_endpoint(request: FactorAnalysisRequest):
+    """
+    Perform Fama-French factor analysis on a single ticker.
+    
+    This endpoint analyzes how a ticker's returns are explained by systematic risk factors
+    (market, size, value, etc.) and calculates alpha (excess return not explained by factors).
+    
+    Request body:
+    - ticker: Stock ticker symbol (e.g., "SPY", "AAPL")
+    - start_date: Start date in YYYY-MM-DD format
+    - end_date: End date in YYYY-MM-DD format
+    - factor_model: Optional, one of "3-factor", "5-factor", "4-factor", "CAPM" (default: "3-factor")
+    - frequency: Optional, one of "daily", "weekly", "monthly" (default: "monthly")
+    - risk_free_rate: Optional, "1M_TBILL" or "3M_TBILL" (default: "1M_TBILL")
+    
+    Returns:
+    - Complete factor analysis results including coefficients, statistics, and time series data
+    """
+    try:
+        # Validate inputs
+        if not request.ticker or not request.ticker.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="ticker is required and cannot be empty"
+            )
+        
+        # Validate dates
+        try:
+            start_dt = pd.Timestamp(request.start_date)
+            end_dt = pd.Timestamp(request.end_date)
+        except (ValueError, TypeError) as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid date format. Use YYYY-MM-DD format. Error: {str(e)}"
+            )
+        
+        if start_dt >= end_dt:
+            raise HTTPException(
+                status_code=400,
+                detail=f"start_date ({request.start_date}) must be before end_date ({request.end_date})"
+            )
+        
+        # Validate factor_model
+        valid_models = ["3-factor", "5-factor", "4-factor", "CAPM"]
+        if request.factor_model not in valid_models:
+            raise HTTPException(
+                status_code=400,
+                detail=f"factor_model must be one of {valid_models}. Got: {request.factor_model}"
+            )
+        
+        # Validate frequency
+        valid_frequencies = ["daily", "weekly", "monthly"]
+        if request.frequency not in valid_frequencies:
+            raise HTTPException(
+                status_code=400,
+                detail=f"frequency must be one of {valid_frequencies}. Got: {request.frequency}"
+            )
+        
+        # Validate risk_free_rate
+        valid_rf_rates = ["1M_TBILL", "3M_TBILL"]
+        if request.risk_free_rate not in valid_rf_rates:
+            raise HTTPException(
+                status_code=400,
+                detail=f"risk_free_rate must be one of {valid_rf_rates}. Got: {request.risk_free_rate}"
+            )
+        
+        # Call the factor analysis function
+        result = analyze_factors(
+            ticker=request.ticker.strip().upper(),
+            start_date=request.start_date,
+            end_date=request.end_date,
+            factor_model=request.factor_model,
+            frequency=request.frequency,
+            risk_free_rate=request.risk_free_rate
+        )
+        
+        return {
+            "success": True,
+            "data": result
+        }
+        
+    except HTTPException:
+        # Re-raise HTTP exceptions (these are intentional)
+        raise
+    except ValueError as e:
+        # Invalid inputs, insufficient data, or unsupported models
+        error_msg = str(e)
+        if "ticker" in error_msg.lower() and ("not found" in error_msg.lower() or "no data" in error_msg.lower()):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Ticker '{request.ticker}' not found or no data available. "
+                       f"Please verify the ticker symbol is correct and has data for the specified date range."
+            )
+        elif "insufficient" in error_msg.lower() or "need at least" in error_msg.lower():
+            raise HTTPException(
+                status_code=400,
+                detail=f"Insufficient data: {error_msg}. "
+                       f"Please use a longer date range or a different frequency."
+            )
+        elif "date" in error_msg.lower():
+            raise HTTPException(
+                status_code=400,
+                detail=f"Date error: {error_msg}. "
+                       f"Please check that dates are in YYYY-MM-DD format and start_date < end_date."
+            )
+        elif "model" in error_msg.lower() or "factor" in error_msg.lower():
+            raise HTTPException(
+                status_code=400,
+                detail=f"Factor model error: {error_msg}. "
+                       f"Note: 4-factor and 5-factor models require additional data sources."
+            )
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid request: {error_msg}. "
+                       f"Please check your inputs and try again."
+            )
+    except ConnectionError as e:
+        # Network errors fetching Fama-French data
+        error_msg = str(e)
+        raise HTTPException(
+            status_code=503,
+            detail=f"Service temporarily unavailable: Failed to fetch Fama-French factor data. "
+                  f"{error_msg}. "
+                  f"Please check your internet connection and try again later."
+        )
+    except ImportError as e:
+        # Missing dependencies
+        error_msg = str(e)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Server configuration error: {error_msg}. "
+                  f"Please contact the administrator."
+        )
+    except Exception as e:
+        # Unexpected errors
+        import traceback
+        error_detail = str(e)
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Factor analysis error: {error_detail}. "
+                  f"Please check your inputs and try again. If the problem persists, contact support."
+        )
 
 
 @app.get("/health")
