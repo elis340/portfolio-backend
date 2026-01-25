@@ -1,6 +1,6 @@
 # Core dependencies
 setuptools>=65.0.0  # Provides distutils compatibility for Python 3.12+
-pandas>=2.0.0
+pandas>=2.0.0,<3.0.0  # Pin to 2.x for pandas-datareader compatibility (pandas 3.0 not yet supported)
 numpy>=1.24.0
 matplotlib>=3.7.0
 yfinance>=0.2.40
