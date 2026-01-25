@@ -106,11 +106,13 @@ def _fetch_ticker_returns(
         if frequency == 'monthly':
             # Resample to month-end and calculate monthly returns
             # Method: compound returns within each month
-            returns = (1 + returns).resample('M').apply(lambda x: x.prod() - 1)
+            # Use 'ME' (month-end) instead of deprecated 'M'
+            returns = (1 + returns).resample('ME').apply(lambda x: x.prod() - 1)
         elif frequency == 'weekly':
             # Resample to week-end (Sunday)
-            returns = (1 + returns).resample('W').apply(lambda x: x.prod() - 1)
-        # For daily, keep as is
+            # Use 'W-SUN' instead of deprecated 'W'
+            returns = (1 + returns).resample('W-SUN').apply(lambda x: x.prod() - 1)
+        # For daily, keep as is (no resampling needed)
         
         returns = returns.dropna()
         
