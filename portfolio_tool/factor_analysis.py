@@ -450,6 +450,14 @@ def analyze_factors(
     
     aligned_data = _align_data(ticker_returns, factors, rf_series)
     
+    # Debug logging: detailed information about aligned data
+    logger.info(f"Date range in aligned data: {aligned_data.index.min()} to {aligned_data.index.max()}")
+    logger.info(f"First 3 rows of aligned data:\n{aligned_data.head(3)}")
+    logger.info(f"Last 3 rows of aligned data:\n{aligned_data.tail(3)}")
+    logger.info(f"Excess returns - Mean: {aligned_data['excess_returns'].mean():.6f}, Std: {aligned_data['excess_returns'].std():.6f}")
+    if 'Mkt-RF' in aligned_data.columns:
+        logger.info(f"Market factor - Mean: {aligned_data['Mkt-RF'].mean():.6f}, Std: {aligned_data['Mkt-RF'].std():.6f}")
+    
     # Check minimum observations
     min_obs = {
         'monthly': MIN_OBSERVATIONS_MONTHLY,
