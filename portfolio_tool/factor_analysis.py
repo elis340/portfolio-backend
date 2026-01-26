@@ -180,6 +180,12 @@ def _align_data(
     ticker_returns = ticker_returns.copy()
     factors = factors.copy()
     
+    # STEP 1: Initial data
+    logger.info(f"=== STEP 1: Initial data ===")
+    logger.info(f"Ticker returns shape: {ticker_returns.shape}, columns: {ticker_returns.name if hasattr(ticker_returns, 'name') else 'Series'}")
+    logger.info(f"Factors shape: {factors.shape}, columns: {factors.columns.tolist()}")
+    logger.info(f"Risk-free rate: {type(risk_free_rate)}, is None: {risk_free_rate is None}")
+    
     # Remove timezone from ticker_returns index if present
     if hasattr(ticker_returns.index, 'tz') and ticker_returns.index.tz is not None:
         ticker_returns.index = ticker_returns.index.tz_localize(None)
@@ -188,11 +194,13 @@ def _align_data(
     if hasattr(factors.index, 'tz') and factors.index.tz is not None:
         factors.index = factors.index.tz_localize(None)
     
-    # Debug logging: show index information before alignment
+    # STEP 2: After timezone stripping
+    logger.info(f"=== STEP 2: After timezone stripping ===")
+    logger.info(f"Ticker returns index has tz: {ticker_returns.index.tz is not None if hasattr(ticker_returns.index, 'tz') else 'No tz attr'}")
+    logger.info(f"Factors index has tz: {factors.index.tz is not None if hasattr(factors.index, 'tz') else 'No tz attr'}")
     logger.info(f"Ticker returns index type: {type(ticker_returns.index)}")
     logger.info(f"Ticker returns date range: {ticker_returns.index.min()} to {ticker_returns.index.max()}")
     logger.info(f"Ticker returns first 3 dates: {ticker_returns.index[:3].tolist()}")
-    
     logger.info(f"Factors index type: {type(factors.index)}")
     logger.info(f"Factors date range: {factors.index.min()} to {factors.index.max()}")
     logger.info(f"Factors first 3 dates: {factors.index[:3].tolist()}")
@@ -209,8 +217,30 @@ def _align_data(
     # Create DataFrame from returns
     aligned = pd.DataFrame({'returns': ticker_returns})
     
+    # STEP 3: After creating aligned DataFrame
+    logger.info(f"=== STEP 3: After creating aligned DataFrame ===")
+    logger.info(f"Aligned shape: {aligned.shape}")
+    logger.info(f"Aligned columns: {aligned.columns.tolist()}")
+    logger.info(f"Aligned index (first 3): {aligned.index[:3].tolist()}")
+    logger.info(f"Aligned has NaN: {aligned.isna().any().any()}")
+    logger.info(f"NaN counts per column: {aligned.isna().sum().to_dict()}")
+    
     # Merge with factors
     aligned = aligned.join(factors, how='inner')
+    
+    # STEP 4: After joining with factors
+    logger.info(f"=== STEP 4: After joining with factors ===")
+    logger.info(f"Aligned shape: {aligned.shape}")
+    logger.info(f"Aligned columns: {aligned.columns.tolist()}")
+    logger.info(f"Number of rows before dropna: {len(aligned)}")
+    logger.info(f"NaN counts per column: {aligned.isna().sum().to_dict()}")
+    if len(aligned) > 0:
+        logger.info(f"First row:\n{aligned.iloc[0]}")
+        logger.info(f"Last row:\n{aligned.iloc[-1]}")
+    else:
+        logger.error(f"!!! JOIN PRODUCED ZERO ROWS !!!")
+        logger.error(f"Ticker index (first 5): {ticker_returns.index[:5].tolist()}")
+        logger.error(f"Factors index (first 5): {factors.index[:5].tolist()}")
     
     # Add risk-free rate if provided
     if risk_free_rate is not None:
@@ -227,8 +257,31 @@ def _align_data(
         # No risk-free rate available, excess = returns
         aligned['excess_returns'] = aligned['returns']
     
+    # STEP 5: After adding risk-free rate
+    logger.info(f"=== STEP 5: After adding risk-free rate ===")
+    logger.info(f"Aligned shape: {aligned.shape}")
+    logger.info(f"Has 'rf' column: {'rf' in aligned.columns}")
+    logger.info(f"Has 'excess_returns' column: {'excess_returns' in aligned.columns}")
+    logger.info(f"NaN counts: {aligned.isna().sum().to_dict()}")
+    
+    # Store count before dropna
+    rows_before_dropna = len(aligned)
+    
     # Drop rows with any NaN values
     aligned = aligned.dropna()
+    
+    # STEP 6: After dropna
+    logger.info(f"=== STEP 6: After dropna ===")
+    logger.info(f"Dropna removed {rows_before_dropna - len(aligned)} rows")
+    logger.info(f"Final aligned shape: {aligned.shape}")
+    if len(aligned) == 0:
+        logger.error(f"!!! ALL ROWS DROPPED BY DROPNA !!!")
+        logger.error(f"DataFrame before dropna had {rows_before_dropna} rows")
+        logger.error(f"This means all rows had at least one NaN value")
+        logger.error(f"Check NaN counts from STEP 5 above to see which columns had NaN values")
+    else:
+        logger.info(f"SUCCESS: {len(aligned)} observations after alignment")
+        logger.info(f"Date range: {aligned.index.min()} to {aligned.index.max()}")
     
     if len(aligned) == 0:
         raise ValueError("No overlapping data between ticker returns and factors after alignment")
