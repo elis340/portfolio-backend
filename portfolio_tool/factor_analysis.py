@@ -248,10 +248,15 @@ def _align_data(
         risk_free_rate = risk_free_rate.copy()
         if hasattr(risk_free_rate.index, 'tz') and risk_free_rate.index.tz is not None:
             risk_free_rate.index = risk_free_rate.index.tz_localize(None)
+        
+        # Normalize risk_free_rate index to match aligned index (month-end)
+        risk_free_rate.index = risk_free_rate.index.to_period('M').to_timestamp('M')
+        
         aligned['rf'] = risk_free_rate.reindex(aligned.index).ffill()
         aligned['excess_returns'] = aligned['returns'] - aligned['rf']
     elif 'RF' in aligned.columns:
-        # Use RF from factors if available
+        # Use RF from factors if available (already aligned)
+        aligned['rf'] = aligned['RF']
         aligned['excess_returns'] = aligned['returns'] - aligned['RF']
     else:
         # No risk-free rate available, excess = returns
