@@ -119,6 +119,10 @@ def _fetch_ticker_returns(
         if len(returns) == 0:
             raise ValueError(f"No returns data after resampling for frequency {frequency}")
         
+        # Strip timezone to ensure compatibility
+        if hasattr(returns.index, 'tz') and returns.index.tz is not None:
+            returns.index = returns.index.tz_localize(None)
+        
         return returns
         
     except Exception as e:
@@ -142,8 +146,8 @@ def _calculate_excess_returns(
         pd.Series: Excess returns
     """
     if isinstance(risk_free_rate, pd.Series):
-        # Align indices
-        aligned_rf = risk_free_rate.reindex(returns.index, method='ffill')
+        # Align indices and forward fill missing values
+        aligned_rf = risk_free_rate.reindex(returns.index).ffill()
         excess = returns - aligned_rf
     else:
         # Scalar risk-free rate
@@ -196,7 +200,7 @@ def _align_data(
         risk_free_rate = risk_free_rate.copy()
         if hasattr(risk_free_rate.index, 'tz') and risk_free_rate.index.tz is not None:
             risk_free_rate.index = risk_free_rate.index.tz_localize(None)
-        aligned['rf'] = risk_free_rate.reindex(aligned.index, method='ffill')
+        aligned['rf'] = risk_free_rate.reindex(aligned.index).ffill()
         aligned['excess_returns'] = aligned['returns'] - aligned['rf']
     elif 'RF' in aligned.columns:
         # Use RF from factors if available
@@ -214,12 +218,12 @@ def _align_data(
     return aligned
 
 
-def _annualize_alpha(monthly_alpha: float, frequency: str) -> float:
+def _annualize_alpha(period_alpha: float, frequency: str) -> float:
     """
     Annualize alpha based on frequency.
     
     Args:
-        monthly_alpha: Monthly alpha (decimal)
+        period_alpha: Alpha for the period (decimal) - can be daily, weekly, or monthly
         frequency: 'daily', 'weekly', or 'monthly'
     
     Returns:
@@ -227,23 +231,23 @@ def _annualize_alpha(monthly_alpha: float, frequency: str) -> float:
     """
     if frequency == 'monthly':
         # Annualize: (1 + monthly_alpha)^12 - 1
-        # For small values, approximate: monthly_alpha * 12
-        if abs(monthly_alpha) < 0.1:
-            return monthly_alpha * 12
+        # For small values, approximate: period_alpha * 12
+        if abs(period_alpha) < 0.1:
+            return period_alpha * 12
         else:
-            return (1 + monthly_alpha) ** 12 - 1
+            return (1 + period_alpha) ** 12 - 1
     elif frequency == 'weekly':
         # Annualize: (1 + weekly_alpha)^52 - 1
-        if abs(monthly_alpha) < 0.1:
-            return monthly_alpha * 52
+        if abs(period_alpha) < 0.1:
+            return period_alpha * 52
         else:
-            return (1 + monthly_alpha) ** 52 - 1
+            return (1 + period_alpha) ** 52 - 1
     else:  # daily
         # Annualize: (1 + daily_alpha)^252 - 1
-        if abs(monthly_alpha) < 0.1:
-            return monthly_alpha * 252
+        if abs(period_alpha) < 0.1:
+            return period_alpha * 252
         else:
-            return (1 + monthly_alpha) ** 252 - 1
+            return (1 + period_alpha) ** 252 - 1
 
 
 def _determine_significance(p_value: float, threshold: float = DEFAULT_SIGNIFICANCE_THRESHOLD) -> bool:
@@ -493,8 +497,9 @@ def analyze_factors(
     # Step 7: Build time series data
     dates = aligned_data.index
     actual_returns = aligned_data['excess_returns'].values
+    # model.fittedvalues and model.resid are already numpy arrays from statsmodels OLS
     predicted_returns = model.fittedvalues
-    residual_values = residuals.values
+    residual_values = residuals
     
     time_series = []
     factor_display_names = _get_factor_display_names(factor_model)
