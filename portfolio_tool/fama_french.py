@@ -98,9 +98,9 @@ def get_factors(start_date, end_date, _version=2):
         )
         end_date = today
     
-    # Kenneth French data library identifier for Fama-French 3 factors (daily)
-    # 'F-F_Research_Data_Factors_daily' is the daily frequency dataset
-    factor_name = 'F-F_Research_Data_Factors_daily'
+    # Kenneth French data library identifier for Fama-French 3 factors (MONTHLY)
+    # 'F-F_Research_Data_Factors' is the monthly frequency dataset
+    factor_name = 'F-F_Research_Data_Factors'
     
     try:
         # Fetch Fama-French 3-factor data
@@ -117,31 +117,42 @@ def get_factors(start_date, end_date, _version=2):
             )
         
         # pandas_datareader returns a dict with different frequencies
-        # For daily data, the key is typically 0 or 'daily'
+        # For monthly data, key 0 typically has the monthly data
         if isinstance(factors_raw, dict):
-            # Try to find the daily data
+            # Get monthly data (first dataframe in the dict, typically index 0)
             if 0 in factors_raw:
                 factors_df = factors_raw[0]
-            elif 'daily' in factors_raw:
-                factors_df = factors_raw['daily']
-            elif len(factors_raw) == 1:
-                # Only one key, use it
+            elif len(factors_raw) > 0:
+                # Use first available dataframe
                 factors_df = list(factors_raw.values())[0]
             else:
-                # Multiple keys, try to find daily
-                for key in factors_raw.keys():
-                    if 'daily' in str(key).lower() or key == 0:
-                        factors_df = factors_raw[key]
-                        break
-                else:
-                    # Use first available
-                    factors_df = list(factors_raw.values())[0]
+                raise ValueError("No data found in factors_raw dict")
         else:
             factors_df = factors_raw
         
         # Ensure we have a DataFrame
         if not isinstance(factors_df, pd.DataFrame):
             raise ValueError(f"Unexpected data format from pandas_datareader: {type(factors_df)}")
+        
+        # Verify we got monthly data (not daily)
+        # Monthly data should have fewer than 200 rows for a 5-year period
+        # Daily data would have 1000+ rows
+        if len(factors_df) > 200:
+            # This looks like daily data, which means the library structure changed
+            # Try to resample to monthly
+            warnings.warn(
+                f"Got {len(factors_df)} rows, appears to be daily data. Resampling to monthly.",
+                UserWarning
+            )
+            # Ensure index is DatetimeIndex before resampling
+            if not isinstance(factors_df.index, pd.DatetimeIndex):
+                # Convert PeriodIndex to DatetimeIndex for monthly data
+                if isinstance(factors_df.index, pd.PeriodIndex):
+                    factors_df.index = factors_df.index.to_timestamp()
+                else:
+                    factors_df.index = pd.to_datetime(factors_df.index)
+            # Resample to month-end
+            factors_df = factors_df.resample('ME').last()
         
         # Kenneth French data is in percentages, convert to decimals
         # Expected columns: Mkt-RF, SMB, HML, RF
@@ -173,9 +184,13 @@ def get_factors(start_date, end_date, _version=2):
         # Ensure index is DatetimeIndex
         if not isinstance(factors_df.index, pd.DatetimeIndex):
             try:
-                factors_df.index = pd.to_datetime(factors_df.index)
-            except (ValueError, TypeError):
-                raise ValueError("Could not convert index to DatetimeIndex")
+                # Convert PeriodIndex to DatetimeIndex for monthly data
+                if isinstance(factors_df.index, pd.PeriodIndex):
+                    factors_df.index = factors_df.index.to_timestamp()
+                else:
+                    factors_df.index = pd.to_datetime(factors_df.index)
+            except (ValueError, TypeError) as e:
+                raise ValueError(f"Could not convert index to DatetimeIndex: {e}") from e
         
         # Filter to requested date range
         factors_df = factors_df.loc[start_date:end_date].copy()
