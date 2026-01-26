@@ -197,6 +197,15 @@ def _align_data(
     logger.info(f"Factors date range: {factors.index.min()} to {factors.index.max()}")
     logger.info(f"Factors first 3 dates: {factors.index[:3].tolist()}")
     
+    # Normalize dates to month period for alignment
+    # Monthly data may have different day-of-month (e.g., 2020-01-01 vs 2020-01-31)
+    # Convert to period and back to ensure they align on the same month
+    ticker_returns.index = ticker_returns.index.to_period('M').to_timestamp('M')
+    factors.index = factors.index.to_period('M').to_timestamp('M')
+    
+    logger.info(f"After normalization - Ticker returns first 3 dates: {ticker_returns.index[:3].tolist()}")
+    logger.info(f"After normalization - Factors first 3 dates: {factors.index[:3].tolist()}")
+    
     # Create DataFrame from returns
     aligned = pd.DataFrame({'returns': ticker_returns})
     
