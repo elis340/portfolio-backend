@@ -164,10 +164,10 @@ def get_factors(start_date, end_date):
         # Select only the required columns
         factors_df = factors_df[required_columns].copy()
         
-        # Convert from percentages to decimals (divide by 100)
-        for col in required_columns:
-            if col in factors_df.columns:
-                factors_df[col] = factors_df[col] / 100.0
+        # Convert from percentages to decimals
+        # Fama-French data is in percentage points (1.5 = 1.5%, not 0.015)
+        # Divide by 100 to convert to decimal form (0.015 = 1.5%) to match yfinance returns
+        factors_df = factors_df / 100.0
         
         # Ensure index is DatetimeIndex
         if not isinstance(factors_df.index, pd.DatetimeIndex):
