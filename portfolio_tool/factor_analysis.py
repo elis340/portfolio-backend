@@ -261,7 +261,10 @@ def _determine_significance(p_value: float, threshold: float = DEFAULT_SIGNIFICA
     Returns:
         bool: True if significant (p < threshold)
     """
-    return p_value < threshold if not pd.isna(p_value) else False
+    if pd.isna(p_value):
+        return False
+    # Convert numpy bool to Python bool for JSON serialization
+    return bool(p_value < threshold)
 
 
 def _get_factor_columns(factor_model: str) -> List[str]:
