@@ -188,6 +188,15 @@ def _align_data(
     if hasattr(factors.index, 'tz') and factors.index.tz is not None:
         factors.index = factors.index.tz_localize(None)
     
+    # Debug logging: show index information before alignment
+    logger.info(f"Ticker returns index type: {type(ticker_returns.index)}")
+    logger.info(f"Ticker returns date range: {ticker_returns.index.min()} to {ticker_returns.index.max()}")
+    logger.info(f"Ticker returns first 3 dates: {ticker_returns.index[:3].tolist()}")
+    
+    logger.info(f"Factors index type: {type(factors.index)}")
+    logger.info(f"Factors date range: {factors.index.min()} to {factors.index.max()}")
+    logger.info(f"Factors first 3 dates: {factors.index[:3].tolist()}")
+    
     # Create DataFrame from returns
     aligned = pd.DataFrame({'returns': ticker_returns})
     
