@@ -29,7 +29,7 @@ except Exception as e:
 
 
 @lru_cache(maxsize=32)
-def get_factors(start_date, end_date):
+def get_factors(start_date, end_date, _version=2):
     """
     Fetch Fama-French 3-factor data from Kenneth French's data library.
     
@@ -42,6 +42,7 @@ def get_factors(start_date, end_date):
     Args:
         start_date: Start date as string (YYYY-MM-DD) or pandas Timestamp
         end_date: End date as string (YYYY-MM-DD) or pandas Timestamp
+        _version: Internal version parameter for cache invalidation (don't pass this)
     
     Returns:
         pandas.DataFrame: DataFrame with DatetimeIndex and columns:
