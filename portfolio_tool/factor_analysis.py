@@ -131,6 +131,71 @@ def _fetch_ticker_returns(
         raise RuntimeError(f"Error fetching data for {ticker}: {str(e)}") from e
 
 
+def _calculate_portfolio_returns(
+    tickers: List[str],
+    weights: List[float],
+    start_date: Union[str, pd.Timestamp],
+    end_date: Union[str, pd.Timestamp],
+    frequency: str = 'monthly'
+) -> Tuple[pd.Series, pd.DataFrame]:
+    """
+    Calculate weighted portfolio returns from multiple tickers.
+
+    Args:
+        tickers: List of ticker symbols
+        weights: List of weights (must sum to 1.0)
+        start_date: Start date (YYYY-MM-DD string or pandas Timestamp)
+        end_date: End date (YYYY-MM-DD string or pandas Timestamp)
+        frequency: 'daily', 'weekly', or 'monthly'
+
+    Returns:
+        Tuple of:
+            - pd.Series: Portfolio returns indexed by date
+            - pd.DataFrame: Individual ticker returns (for attribution analysis)
+
+    Raises:
+        ValueError: If tickers/weights mismatch or weights don't sum to 1.0
+    """
+    # Validate inputs
+    if len(tickers) != len(weights):
+        raise ValueError(f"Number of tickers ({len(tickers)}) must match number of weights ({len(weights)})")
+
+    weights_sum = sum(weights)
+    if not np.isclose(weights_sum, 1.0, atol=0.01):
+        raise ValueError(f"Weights must sum to 1.0, got {weights_sum:.4f}")
+
+    # Normalize weights to exactly 1.0
+    weights = [w / weights_sum for w in weights]
+
+    # Fetch returns for each ticker
+    all_returns = {}
+    for ticker in tickers:
+        try:
+            returns = _fetch_ticker_returns(ticker, start_date, end_date, frequency)
+            all_returns[ticker] = returns
+            logger.info(f"Fetched {len(returns)} {frequency} returns for {ticker}")
+        except Exception as e:
+            raise ValueError(f"Failed to fetch returns for {ticker}: {str(e)}") from e
+
+    # Combine into DataFrame
+    returns_df = pd.DataFrame(all_returns)
+
+    # Align all returns to common dates (only keep dates where all tickers have data)
+    returns_df = returns_df.dropna()
+
+    if len(returns_df) == 0:
+        raise ValueError("No overlapping data between tickers after alignment")
+
+    logger.info(f"Portfolio has {len(returns_df)} aligned observations for {len(tickers)} tickers")
+
+    # Calculate weighted portfolio returns
+    weights_array = np.array(weights)
+    portfolio_returns = (returns_df * weights_array).sum(axis=1)
+    portfolio_returns.name = 'returns'
+
+    return portfolio_returns, returns_df
+
+
 def _calculate_excess_returns(
     returns: pd.Series,
     risk_free_rate: Union[pd.Series, float]
@@ -392,72 +457,112 @@ def _get_factor_display_names(factor_model: str) -> Dict[str, str]:
 
 
 def analyze_factors(
-    ticker: str,
-    start_date: Union[str, pd.Timestamp],
-    end_date: Union[str, pd.Timestamp],
+    ticker: Optional[str] = None,
+    tickers: Optional[List[str]] = None,
+    weights: Optional[List[float]] = None,
+    start_date: Optional[Union[str, pd.Timestamp]] = None,
+    end_date: Optional[Union[str, pd.Timestamp]] = None,
     factor_model: str = '3-factor',
     frequency: str = 'monthly',
     risk_free_rate: str = '1M_TBILL'
 ) -> Dict:
     """
-    Perform Fama-French factor analysis on a ticker.
-    
+    Perform Fama-French factor analysis on a single ticker or portfolio.
+
     This function:
-    1. Fetches ticker price data and converts to returns
-    2. Fetches Fama-French factor data
+    1. Fetches ticker/portfolio price data and converts to returns
+    2. Fetches Fama-French factor data (3-factor, 5-factor, 4-factor, or CAPM)
     3. Aligns data and calculates excess returns
     4. Runs regression: excess_returns = α + β_factors * factors + ε
     5. Extracts coefficients, t-stats, p-values, R²
-    6. Calculates annualized alpha
-    
+    6. Calculates annualized alpha and return attribution
+
     Args:
-        ticker: Stock ticker symbol (e.g., 'SPY', 'AAPL')
+        ticker: Single stock ticker symbol (e.g., 'SPY', 'AAPL') - use this OR tickers+weights
+        tickers: List of ticker symbols for portfolio analysis
+        weights: List of weights for each ticker (must sum to 1.0)
         start_date: Start date (YYYY-MM-DD string or pandas Timestamp)
         end_date: End date (YYYY-MM-DD string or pandas Timestamp)
         factor_model: '3-factor', '5-factor', '4-factor', or 'CAPM'
         frequency: 'daily', 'weekly', or 'monthly' (default: 'monthly')
         risk_free_rate: '1M_TBILL' (use RF from Fama-French), '3M_TBILL', or custom rate
-    
+
     Returns:
         dict: Comprehensive factor analysis results with structure:
             {
                 "model": str,
-                "ticker": str,
+                "ticker": str (or "Portfolio (N holdings)"),
                 "period": {...},
                 "coefficients": {...},
                 "statistics": {...},
+                "regression_stats": {...},
+                "factor_premiums": {...},
+                "return_attribution": {...},
                 "time_series": [...]
             }
-    
+
     Raises:
         ValueError: Invalid inputs, insufficient data, or unsupported model
         ConnectionError: Network errors fetching data
         ImportError: Missing required dependencies
-    
-    Example:
+
+    Example (single ticker):
         >>> result = analyze_factors(
         ...     ticker="SPY",
         ...     start_date="2020-01-01",
         ...     end_date="2025-01-01",
-        ...     factor_model="3-factor",
-        ...     frequency="monthly"
+        ...     factor_model="3-factor"
         ... )
-        >>> print(result['statistics']['alpha_annualized'])
-        0.0123
+
+    Example (portfolio):
+        >>> result = analyze_factors(
+        ...     tickers=["AAPL", "MSFT", "GOOGL"],
+        ...     weights=[0.4, 0.35, 0.25],
+        ...     start_date="2020-01-01",
+        ...     end_date="2025-01-01",
+        ...     factor_model="5-factor"
+        ... )
     """
-    # Validate inputs
+    # Validate ticker/portfolio inputs
+    is_portfolio = False
+    portfolio_tickers = None
+    portfolio_weights = None
+    ticker_name = None
+
+    if ticker and tickers:
+        raise ValueError("Provide either 'ticker' OR 'tickers' with 'weights', not both")
+
+    if ticker:
+        # Single ticker mode
+        ticker_name = ticker.upper()
+        is_portfolio = False
+    elif tickers and weights:
+        # Portfolio mode
+        portfolio_tickers = [t.upper() for t in tickers]
+        portfolio_weights = weights
+        ticker_name = f"Portfolio ({len(tickers)} holdings)"
+        is_portfolio = True
+    elif tickers and not weights:
+        raise ValueError("Must provide 'weights' when using multiple tickers")
+    else:
+        raise ValueError("Must provide either 'ticker' or 'tickers' with 'weights'")
+
+    # Validate factor model
     if factor_model not in ['3-factor', '5-factor', '4-factor', 'CAPM']:
         raise ValueError(
             f"Factor model must be one of: '3-factor', '5-factor', '4-factor', 'CAPM'. "
             f"Got: {factor_model}"
         )
-    
+
     if frequency not in ['daily', 'weekly', 'monthly']:
         raise ValueError(
             f"Frequency must be one of: 'daily', 'weekly', 'monthly'. Got: {frequency}"
         )
-    
-    # Convert dates
+
+    # Validate and convert dates
+    if start_date is None or end_date is None:
+        raise ValueError("start_date and end_date are required")
+
     try:
         if isinstance(start_date, str):
             start_date = pd.Timestamp(start_date)
@@ -465,44 +570,57 @@ def analyze_factors(
             end_date = pd.Timestamp(end_date)
     except (ValueError, TypeError) as e:
         raise ValueError(f"Invalid date format. Use YYYY-MM-DD. Error: {e}") from e
-    
+
     if start_date >= end_date:
         raise ValueError(f"Start date ({start_date}) must be before end date ({end_date})")
-    
+
     if not STATSMODELS_AVAILABLE:
         raise ImportError("statsmodels is required. Install with: pip install statsmodels")
-    
-    logger.info(f"Starting factor analysis for {ticker} using {factor_model} model")
-    
-    # Step 1: Fetch ticker returns
-    logger.info(f"Fetching returns for {ticker}")
-    ticker_returns = _fetch_ticker_returns(ticker, start_date, end_date, frequency)
-    
+
+    logger.info(f"Starting factor analysis for {ticker_name} using {factor_model} model")
+
+    # Step 1: Fetch returns (single ticker or portfolio)
+    individual_returns_df = None
+    if is_portfolio:
+        logger.info(f"Fetching returns for portfolio: {portfolio_tickers}")
+        ticker_returns, individual_returns_df = _calculate_portfolio_returns(
+            portfolio_tickers, portfolio_weights, start_date, end_date, frequency
+        )
+    else:
+        logger.info(f"Fetching returns for {ticker_name}")
+        ticker_returns = _fetch_ticker_returns(ticker_name, start_date, end_date, frequency)
+
     # Step 2: Fetch Fama-French factors
+    # Determine which factors to fetch based on model
+    include_5_factor = factor_model in ['5-factor']
+    include_momentum = factor_model in ['4-factor']
+
     logger.info(f"Fetching Fama-French {factor_model} factors")
     try:
-        factors = get_factors(start_date, end_date)
+        factors = get_factors(
+            start_date, end_date,
+            include_5_factor=include_5_factor or True,  # Always fetch 5-factor for flexibility
+            include_momentum=include_momentum or True    # Always fetch momentum for flexibility
+        )
     except Exception as e:
         raise ConnectionError(f"Failed to fetch Fama-French data: {str(e)}") from e
-    
+
     # Check if we have required factors
     required_factors = _get_factor_columns(factor_model)
     missing_factors = [f for f in required_factors if f not in factors.columns]
-    
+
     if missing_factors:
-        # For 4-factor and 5-factor, we may need to fetch additional data
-        # For now, raise error if factors are missing
         if factor_model == '4-factor' and 'MOM' not in factors.columns:
             raise ValueError(
-                "Momentum (MOM) factor not available in Fama-French 3-factor data. "
-                "4-factor model requires separate momentum data."
+                "Momentum (MOM) factor not available. "
+                "4-factor model requires momentum data which could not be fetched."
             )
         elif factor_model == '5-factor':
             missing = [f for f in ['RMW', 'CMA'] if f not in factors.columns]
             if missing:
                 raise ValueError(
                     f"5-factor model requires RMW and CMA factors. Missing: {missing}. "
-                    "These are not available in the 3-factor dataset."
+                    "These factors could not be fetched."
                 )
         else:
             raise ValueError(f"Missing required factors: {missing_factors}")
@@ -806,7 +924,8 @@ def analyze_factors(
     # Step 9: Build final result dictionary
     result = {
         "model": _get_model_name(factor_model),
-        "ticker": ticker.upper(),
+        "ticker": ticker_name,
+        "is_portfolio": is_portfolio,
         "period": {
             "start": start_date.strftime('%Y-%m-%d'),
             "end": end_date.strftime('%Y-%m-%d'),
@@ -855,8 +974,15 @@ def analyze_factors(
         result["statistics"]["alpha_daily"] = float(alpha)
     elif frequency == 'weekly':
         result["statistics"]["alpha_weekly"] = float(alpha)
-    
+
+    # Add portfolio composition if portfolio analysis
+    if is_portfolio and portfolio_tickers and portfolio_weights:
+        result["portfolio_composition"] = [
+            {"ticker": t, "weight": round(w, 4)}
+            for t, w in zip(portfolio_tickers, portfolio_weights)
+        ]
+
     logger.info(f"Factor analysis complete. R² = {r_squared:.3f}, Alpha (annualized) = {alpha_annualized:.4f}")
-    
+
     return result
 

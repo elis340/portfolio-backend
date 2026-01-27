@@ -293,9 +293,15 @@ class PortfolioRequest(BaseModel):
 
 
 class FactorAnalysisRequest(BaseModel):
-    ticker: str
-    start_date: str  # ISO format date string (YYYY-MM-DD)
-    end_date: str  # ISO format date string (YYYY-MM-DD)
+    # Single ticker (backward compatible)
+    ticker: Optional[str] = None
+    # Multiple tickers for portfolio analysis
+    tickers: Optional[List[str]] = None
+    weights: Optional[List[float]] = None  # Must sum to 1.0
+    # Date range
+    start_date: Optional[str] = None  # ISO format date string (YYYY-MM-DD)
+    end_date: Optional[str] = None  # ISO format date string (YYYY-MM-DD)
+    # Analysis parameters
     factor_model: str = "3-factor"  # Options: "3-factor", "5-factor", "4-factor", "CAPM"
     frequency: str = "monthly"  # Options: "daily", "weekly", "monthly"
     risk_free_rate: str = "1M_TBILL"  # Options: "1M_TBILL", "3M_TBILL"
@@ -1221,29 +1227,67 @@ async def analyze_factors_endpoint(request: FactorAnalysisRequest):
     """
     Perform Fama-French factor analysis on a single ticker.
     
-    This endpoint analyzes how a ticker's returns are explained by systematic risk factors
-    (market, size, value, etc.) and calculates alpha (excess return not explained by factors).
-    
-    Request body:
+    This endpoint analyzes how a ticker's or portfolio's returns are explained by systematic
+    risk factors (market, size, value, etc.) and calculates alpha (excess return not explained by factors).
+
+    Request body (Single Ticker):
     - ticker: Stock ticker symbol (e.g., "SPY", "AAPL")
     - start_date: Start date in YYYY-MM-DD format
     - end_date: End date in YYYY-MM-DD format
-    - factor_model: Optional, one of "3-factor", "5-factor", "4-factor", "CAPM" (default: "3-factor")
-    - frequency: Optional, one of "daily", "weekly", "monthly" (default: "monthly")
-    - risk_free_rate: Optional, "1M_TBILL" or "3M_TBILL" (default: "1M_TBILL")
-    
+    - factor_model: "3-factor", "5-factor", "4-factor", or "CAPM" (default: "3-factor")
+    - frequency: "daily", "weekly", or "monthly" (default: "monthly")
+    - risk_free_rate: "1M_TBILL" or "3M_TBILL" (default: "1M_TBILL")
+
+    Request body (Portfolio):
+    - tickers: List of ticker symbols (e.g., ["AAPL", "MSFT", "GOOGL"])
+    - weights: List of weights for each ticker (must sum to 1.0)
+    - start_date, end_date, factor_model, frequency, risk_free_rate: Same as above
+
     Returns:
     - Complete factor analysis results including coefficients, statistics, and time series data
     """
     try:
-        # Validate inputs
-        if not request.ticker or not request.ticker.strip():
+        # Validate ticker/portfolio inputs
+        has_single_ticker = request.ticker and request.ticker.strip()
+        has_portfolio = request.tickers and len(request.tickers) > 0
+
+        if not has_single_ticker and not has_portfolio:
             raise HTTPException(
                 status_code=400,
-                detail="ticker is required and cannot be empty"
+                detail="Must provide either 'ticker' for single ticker analysis or 'tickers' with 'weights' for portfolio analysis"
             )
-        
+
+        if has_single_ticker and has_portfolio:
+            raise HTTPException(
+                status_code=400,
+                detail="Provide either 'ticker' OR 'tickers' with 'weights', not both"
+            )
+
+        if has_portfolio:
+            if not request.weights or len(request.weights) == 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Must provide 'weights' when using multiple tickers"
+                )
+            if len(request.tickers) != len(request.weights):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Number of tickers ({len(request.tickers)}) must match number of weights ({len(request.weights)})"
+                )
+            weights_sum = sum(request.weights)
+            if not (0.99 <= weights_sum <= 1.01):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Weights must sum to 1.0, got {weights_sum:.4f}"
+                )
+
         # Validate dates
+        if not request.start_date or not request.end_date:
+            raise HTTPException(
+                status_code=400,
+                detail="start_date and end_date are required"
+            )
+
         try:
             start_dt = pd.Timestamp(request.start_date)
             end_dt = pd.Timestamp(request.end_date)
@@ -1252,13 +1296,13 @@ async def analyze_factors_endpoint(request: FactorAnalysisRequest):
                 status_code=400,
                 detail=f"Invalid date format. Use YYYY-MM-DD format. Error: {str(e)}"
             )
-        
+
         if start_dt >= end_dt:
             raise HTTPException(
                 status_code=400,
                 detail=f"start_date ({request.start_date}) must be before end_date ({request.end_date})"
             )
-        
+
         # Validate factor_model
         valid_models = ["3-factor", "5-factor", "4-factor", "CAPM"]
         if request.factor_model not in valid_models:
@@ -1266,7 +1310,7 @@ async def analyze_factors_endpoint(request: FactorAnalysisRequest):
                 status_code=400,
                 detail=f"factor_model must be one of {valid_models}. Got: {request.factor_model}"
             )
-        
+
         # Validate frequency
         valid_frequencies = ["daily", "weekly", "monthly"]
         if request.frequency not in valid_frequencies:
@@ -1274,7 +1318,7 @@ async def analyze_factors_endpoint(request: FactorAnalysisRequest):
                 status_code=400,
                 detail=f"frequency must be one of {valid_frequencies}. Got: {request.frequency}"
             )
-        
+
         # Validate risk_free_rate
         valid_rf_rates = ["1M_TBILL", "3M_TBILL"]
         if request.risk_free_rate not in valid_rf_rates:
@@ -1282,17 +1326,28 @@ async def analyze_factors_endpoint(request: FactorAnalysisRequest):
                 status_code=400,
                 detail=f"risk_free_rate must be one of {valid_rf_rates}. Got: {request.risk_free_rate}"
             )
-        
+
         # Call the factor analysis function
-        result = analyze_factors(
-            ticker=request.ticker.strip().upper(),
-            start_date=request.start_date,
-            end_date=request.end_date,
-            factor_model=request.factor_model,
-            frequency=request.frequency,
-            risk_free_rate=request.risk_free_rate
-        )
-        
+        if has_single_ticker:
+            result = analyze_factors(
+                ticker=request.ticker.strip().upper(),
+                start_date=request.start_date,
+                end_date=request.end_date,
+                factor_model=request.factor_model,
+                frequency=request.frequency,
+                risk_free_rate=request.risk_free_rate
+            )
+        else:
+            result = analyze_factors(
+                tickers=[t.strip().upper() for t in request.tickers],
+                weights=request.weights,
+                start_date=request.start_date,
+                end_date=request.end_date,
+                factor_model=request.factor_model,
+                frequency=request.frequency,
+                risk_free_rate=request.risk_free_rate
+            )
+
         return {
             "success": True,
             "data": result

@@ -102,6 +102,61 @@ Response format:
 }
 ```
 
+### POST /factors/analyze
+
+Perform Fama-French factor analysis on a single ticker or portfolio.
+
+**Single Ticker Analysis:**
+
+```json
+{
+  "ticker": "SPY",
+  "start_date": "2020-01-01",
+  "end_date": "2025-01-01",
+  "factor_model": "3-factor",
+  "frequency": "monthly",
+  "risk_free_rate": "1M_TBILL"
+}
+```
+
+**Portfolio Analysis (Multiple Tickers):**
+
+```json
+{
+  "tickers": ["AAPL", "MSFT", "GOOGL"],
+  "weights": [0.4, 0.35, 0.25],
+  "start_date": "2020-01-01",
+  "end_date": "2025-01-01",
+  "factor_model": "5-factor",
+  "frequency": "monthly",
+  "risk_free_rate": "1M_TBILL"
+}
+```
+
+**Factor Models:**
+- `"CAPM"` - Capital Asset Pricing Model (Market only)
+- `"3-factor"` - Fama-French 3-Factor (Market, Size, Value)
+- `"4-factor"` - Carhart 4-Factor (Market, Size, Value, Momentum)
+- `"5-factor"` - Fama-French 5-Factor (Market, Size, Value, Profitability, Investment)
+
+**Frequencies:**
+- `"daily"` - Daily returns
+- `"weekly"` - Weekly returns
+- `"monthly"` - Monthly returns (recommended)
+
+**Risk-Free Rates:**
+- `"1M_TBILL"` - 1-Month Treasury Bill (from Fama-French data)
+- `"3M_TBILL"` - 3-Month Treasury Bill
+
+**Response includes:**
+- `coefficients` - Factor loadings with t-stats and p-values
+- `statistics` - R², adjusted R², alpha (annualized), significance
+- `regression_stats` - F-statistic and p-value
+- `factor_premiums` - Average factor premiums in basis points
+- `return_attribution` - Total return, factor contributions, risk decomposition
+- `time_series` - Monthly actual vs predicted returns
+- `portfolio_composition` - (Portfolio only) List of tickers and weights
+
 ### Error Handling
 
 - Frontend has retry logic (3 attempts, exponential backoff)
