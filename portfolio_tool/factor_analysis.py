@@ -580,7 +580,136 @@ def analyze_factors(
     
     # Annualize alpha
     alpha_annualized = _annualize_alpha(alpha, frequency)
-    
+
+    # Step 6b: Calculate additional statistics
+    num_observations = len(aligned_data)
+
+    # Regression statistics (F-statistic)
+    f_statistic = float(model.fvalue) if model.fvalue is not None else None
+    f_statistic_p_value = float(model.f_pvalue) if model.f_pvalue is not None else None
+
+    # Factor premiums (in basis points - multiply by 10000)
+    factor_premiums = {}
+    if 'Mkt-RF' in aligned_data.columns:
+        factor_premiums['market_premium_bps'] = round(float(aligned_data['Mkt-RF'].mean() * 10000), 2)
+    if 'SMB' in aligned_data.columns:
+        factor_premiums['smb_premium_bps'] = round(float(aligned_data['SMB'].mean() * 10000), 2)
+    if 'HML' in aligned_data.columns:
+        factor_premiums['hml_premium_bps'] = round(float(aligned_data['HML'].mean() * 10000), 2)
+    if 'MOM' in aligned_data.columns:
+        factor_premiums['mom_premium_bps'] = round(float(aligned_data['MOM'].mean() * 10000), 2)
+    if 'RMW' in aligned_data.columns:
+        factor_premiums['rmw_premium_bps'] = round(float(aligned_data['RMW'].mean() * 10000), 2)
+    if 'CMA' in aligned_data.columns:
+        factor_premiums['cma_premium_bps'] = round(float(aligned_data['CMA'].mean() * 10000), 2)
+
+    # Return attribution calculations
+    # Total return = cumulative return over period
+    total_return = float((1 + aligned_data['returns']).prod() - 1)
+
+    # Annualized return (assuming monthly frequency for now)
+    periods_per_year = {'monthly': 12, 'weekly': 52, 'daily': 252}.get(frequency, 12)
+    if num_observations > 0:
+        annualized_return = float((1 + total_return) ** (periods_per_year / num_observations) - 1)
+    else:
+        annualized_return = 0.0
+
+    # Annualized standard deviation
+    annualized_std = float(aligned_data['returns'].std() * np.sqrt(periods_per_year))
+
+    # Factor contributions to return
+    # Contribution = beta * sum of factor returns over period
+    market_contribution = 0.0
+    smb_contribution = 0.0
+    hml_contribution = 0.0
+    mom_contribution = 0.0
+    rmw_contribution = 0.0
+    cma_contribution = 0.0
+
+    if 'Mkt-RF' in required_factors:
+        idx = required_factors.index('Mkt-RF')
+        market_contribution = float(factor_loadings[idx] * aligned_data['Mkt-RF'].sum())
+    if 'SMB' in required_factors:
+        idx = required_factors.index('SMB')
+        smb_contribution = float(factor_loadings[idx] * aligned_data['SMB'].sum())
+    if 'HML' in required_factors:
+        idx = required_factors.index('HML')
+        hml_contribution = float(factor_loadings[idx] * aligned_data['HML'].sum())
+    if 'MOM' in required_factors:
+        idx = required_factors.index('MOM')
+        mom_contribution = float(factor_loadings[idx] * aligned_data['MOM'].sum())
+    if 'RMW' in required_factors:
+        idx = required_factors.index('RMW')
+        rmw_contribution = float(factor_loadings[idx] * aligned_data['RMW'].sum())
+    if 'CMA' in required_factors:
+        idx = required_factors.index('CMA')
+        cma_contribution = float(factor_loadings[idx] * aligned_data['CMA'].sum())
+
+    # Alpha contribution = alpha * number of periods
+    alpha_contribution = float(alpha * num_observations)
+
+    # Risk contribution (variance decomposition)
+    total_var = aligned_data['returns'].var()
+    residual_var = float(np.var(residuals))
+
+    # Initialize risk contributions
+    risk_contribution = {}
+
+    if total_var > 0:
+        # Market risk contribution
+        if 'Mkt-RF' in required_factors:
+            idx = required_factors.index('Mkt-RF')
+            market_std = aligned_data['Mkt-RF'].std()
+            market_risk = (factor_loadings[idx] * market_std) ** 2 / total_var
+            risk_contribution['market_risk'] = round(float(market_risk), 4)
+
+        # SMB risk contribution
+        if 'SMB' in required_factors:
+            idx = required_factors.index('SMB')
+            smb_std = aligned_data['SMB'].std()
+            smb_risk = (factor_loadings[idx] * smb_std) ** 2 / total_var
+            risk_contribution['smb_risk'] = round(float(smb_risk), 4)
+
+        # HML risk contribution
+        if 'HML' in required_factors:
+            idx = required_factors.index('HML')
+            hml_std = aligned_data['HML'].std()
+            hml_risk = (factor_loadings[idx] * hml_std) ** 2 / total_var
+            risk_contribution['hml_risk'] = round(float(hml_risk), 4)
+
+        # MOM risk contribution (if applicable)
+        if 'MOM' in required_factors:
+            idx = required_factors.index('MOM')
+            mom_std = aligned_data['MOM'].std()
+            mom_risk = (factor_loadings[idx] * mom_std) ** 2 / total_var
+            risk_contribution['mom_risk'] = round(float(mom_risk), 4)
+
+        # RMW risk contribution (if applicable)
+        if 'RMW' in required_factors:
+            idx = required_factors.index('RMW')
+            rmw_std = aligned_data['RMW'].std()
+            rmw_risk = (factor_loadings[idx] * rmw_std) ** 2 / total_var
+            risk_contribution['rmw_risk'] = round(float(rmw_risk), 4)
+
+        # CMA risk contribution (if applicable)
+        if 'CMA' in required_factors:
+            idx = required_factors.index('CMA')
+            cma_std = aligned_data['CMA'].std()
+            cma_risk = (factor_loadings[idx] * cma_std) ** 2 / total_var
+            risk_contribution['cma_risk'] = round(float(cma_risk), 4)
+
+        # Alpha (idiosyncratic) risk contribution
+        alpha_risk = residual_var / total_var
+        risk_contribution['alpha_risk'] = round(float(alpha_risk), 4)
+    else:
+        # Handle edge case of zero variance
+        risk_contribution = {
+            'market_risk': 0.0,
+            'smb_risk': 0.0,
+            'hml_risk': 0.0,
+            'alpha_risk': 0.0
+        }
+
     # Step 7: Build time series data
     dates = aligned_data.index
     actual_returns = aligned_data['excess_returns'].values
@@ -681,7 +810,7 @@ def analyze_factors(
         "period": {
             "start": start_date.strftime('%Y-%m-%d'),
             "end": end_date.strftime('%Y-%m-%d'),
-            "observations": len(aligned_data),
+            "observations": num_observations,
             "frequency": frequency
         },
         "coefficients": coefficients_dict,
@@ -695,8 +824,31 @@ def analyze_factors(
             "alpha_significant": _determine_significance(alpha_p_value),
             "residual_std": float(np.std(residuals))
         },
+        "regression_stats": {
+            "f_statistic": round(f_statistic, 4) if f_statistic is not None else None,
+            "f_statistic_p_value": round(f_statistic_p_value, 6) if f_statistic_p_value is not None else None
+        },
+        "factor_premiums": factor_premiums,
+        "return_attribution": {
+            "total_return": round(total_return, 4),
+            "annualized_return": round(annualized_return, 4),
+            "annualized_std": round(annualized_std, 4),
+            "market_contribution": round(market_contribution, 4),
+            "smb_contribution": round(smb_contribution, 4),
+            "hml_contribution": round(hml_contribution, 4),
+            "alpha_contribution": round(alpha_contribution, 4),
+            "risk_contribution": risk_contribution
+        },
         "time_series": time_series
     }
+
+    # Add additional factor contributions if using extended models
+    if 'MOM' in required_factors:
+        result["return_attribution"]["mom_contribution"] = round(mom_contribution, 4)
+    if 'RMW' in required_factors:
+        result["return_attribution"]["rmw_contribution"] = round(rmw_contribution, 4)
+    if 'CMA' in required_factors:
+        result["return_attribution"]["cma_contribution"] = round(cma_contribution, 4)
     
     # Add frequency-specific alpha if not monthly
     if frequency == 'daily':

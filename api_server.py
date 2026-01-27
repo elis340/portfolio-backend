@@ -7,7 +7,17 @@ from typing import List, Dict, Optional
 import pandas as pd
 import numpy as np
 import io
+import logging
+import time
+import uuid
 from datetime import datetime, timedelta
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("portfolio-api")
 
 def safe_float(value, default=0.0):
     """
@@ -330,16 +340,34 @@ def parse_portfolio_text(portfolio_text: str) -> pd.DataFrame:
 @app.post("/analyze")
 async def analyze_portfolio(request: PortfolioRequest):
     """Analyze portfolio and return formatted results matching frontend expectations."""
+    request_id = str(uuid.uuid4())[:8]
+    start_time = time.time()
+
+    # Log incoming request
+    logger.info(f"[{request_id}] === NEW /analyze REQUEST ===")
+    logger.info(f"[{request_id}] Received request at {datetime.now().isoformat()}")
+    logger.info(f"[{request_id}] Portfolio text length: {len(request.portfolioText) if request.portfolioText else 0} chars")
+    logger.info(f"[{request_id}] Requested start date: {request.requested_start_date}")
+
+    # Log first 500 chars of portfolio text for debugging (avoid logging huge payloads)
+    portfolio_preview = request.portfolioText[:500] if request.portfolioText else "(empty)"
+    logger.info(f"[{request_id}] Portfolio preview: {portfolio_preview}")
+
     try:
         # Parse portfolio from text
+        logger.info(f"[{request_id}] Parsing portfolio text...")
         portfolio_df = parse_portfolio_text(request.portfolioText)
         
         tickers = portfolio_df['ticker'].tolist()
         weights = portfolio_df.set_index('ticker')['weight'].to_dict()
-        
+
+        logger.info(f"[{request_id}] Parsed {len(tickers)} tickers: {tickers}")
+        logger.info(f"[{request_id}] Weights: {weights}")
+
         # Filter out cash tickers before fetching prices (cash has no price data)
         from portfolio_tool.analytics import is_cash_ticker
         invested_tickers = [ticker for ticker in tickers if not is_cash_ticker(ticker)]
+        logger.info(f"[{request_id}] Invested (non-cash) tickers: {invested_tickers}")
         
         benchmark_ticker = "SPY"
         today = datetime.today()
@@ -366,16 +394,19 @@ async def analyze_portfolio(request: PortfolioRequest):
         
         # Fetch real market data (only for invested tickers, not cash)
         # If no invested tickers, we still need benchmark data
+        logger.info(f"[{request_id}] Fetching market data from {fetch_start_date} to {fetch_end_date}")
         if invested_tickers:
             all_tickers = invested_tickers + [benchmark_ticker]
             prices_all = get_price_history(all_tickers, fetch_start_date, fetch_end_date)
             prices_portfolio = prices_all[invested_tickers]
             prices_benchmark = prices_all[[benchmark_ticker]]
+            logger.info(f"[{request_id}] Fetched {len(prices_all)} days of price data for {len(all_tickers)} tickers")
         else:
             # Portfolio is 100% cash - only fetch benchmark
             prices_all = get_price_history([benchmark_ticker], fetch_start_date, fetch_end_date)
             prices_portfolio = pd.DataFrame()  # Empty DataFrame for 100% cash portfolio
             prices_benchmark = prices_all[[benchmark_ticker]]
+            logger.info(f"[{request_id}] 100% cash portfolio - fetched benchmark only")
         
         # Get as_of_date: last common available trading date across portfolio and benchmark
         # Find minimum of last available dates to ensure we have data for all holdings
@@ -443,15 +474,28 @@ async def analyze_portfolio(request: PortfolioRequest):
         # Window prices to [effective_start_date, as_of_date]
         prices_portfolio_windowed = slice_to_effective_window(prices_portfolio, effective_start_date, as_of_date)
         prices_benchmark_windowed = slice_to_effective_window(prices_benchmark, effective_start_date, as_of_date)
-        
+
+        # Log analysis window details
+        logger.info(f"[{request_id}] Analysis window computed:")
+        logger.info(f"[{request_id}]   - Common start date: {common_start_date}")
+        logger.info(f"[{request_id}]   - Effective start date: {effective_start_date}")
+        logger.info(f"[{request_id}]   - As-of date: {as_of_date}")
+        logger.info(f"[{request_id}]   - Start date adjusted: {start_date_adjusted}")
+        if limiting_ticker:
+            logger.info(f"[{request_id}]   - Limiting ticker: {limiting_ticker} (started {limiting_start_date})")
+
         # Calculate period length in fractional years for annualization
         period_days = (as_of_date - effective_start_date).days
         period_years = period_days / 365.25 if period_days > 0 else None
-        
+        logger.info(f"[{request_id}] Analysis period: {period_days} days ({period_years:.2f} years)" if period_years else f"[{request_id}] Analysis period: {period_days} days")
+
         # Get risk-free rate
         risk_free_rate = get_risk_free_rate('^TNX')
         if risk_free_rate is None:
             risk_free_rate = 0.02  # Default 2%
+            logger.warning(f"[{request_id}] Could not fetch risk-free rate, using default 2%")
+        else:
+            logger.info(f"[{request_id}] Risk-free rate: {risk_free_rate:.4f}")
         
         # Compute daily returns and cumulative index ONCE using the windowed prices
         # These will be used for ALL metrics to ensure consistency
@@ -1141,16 +1185,34 @@ async def analyze_portfolio(request: PortfolioRequest):
             'warnings': warnings,
             'auditLog': audit_log  # Temporary audit log for debugging consistency
         }
-        
+
+        # Log successful response
+        elapsed_time = time.time() - start_time
+        logger.info(f"[{request_id}] === RESPONSE READY ===")
+        logger.info(f"[{request_id}] Processing time: {elapsed_time:.2f} seconds")
+        logger.info(f"[{request_id}] Response contains {len(holdings)} holdings")
+        logger.info(f"[{request_id}] Warnings: {warnings if warnings else 'None'}")
+        logger.info(f"[{request_id}] Analysis window: {response_data['analysisWindow']['effectiveStartDate']} to {response_data['analysisWindow']['asOfDate']}")
+        logger.info(f"[{request_id}] Risk metrics - Sharpe: {risk_metrics.get('sharpeRatio')}, Volatility: {risk_metrics.get('annualVolatility')}")
+        logger.info(f"[{request_id}] === END REQUEST [{request_id}] ===")
+
         return {
             'success': True,
             'data': response_data
         }
-        
+
     except Exception as e:
         import traceback
+        elapsed_time = time.time() - start_time
         error_detail = str(e)
-        traceback.print_exc()
+
+        # Log error details
+        logger.error(f"[{request_id}] === ERROR ===")
+        logger.error(f"[{request_id}] Error after {elapsed_time:.2f} seconds: {error_detail}")
+        logger.error(f"[{request_id}] Error type: {type(e).__name__}")
+        logger.error(f"[{request_id}] Stack trace:\n{traceback.format_exc()}")
+        logger.error(f"[{request_id}] === END ERROR [{request_id}] ===")
+
         raise HTTPException(status_code=500, detail=f"Portfolio analysis error: {error_detail}")
 
 
