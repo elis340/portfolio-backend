@@ -3,7 +3,7 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 import pandas as pd
 import numpy as np
 import io
@@ -11,6 +11,7 @@ import logging
 import time
 import uuid
 from datetime import datetime, timedelta
+from dateutil.relativedelta import relativedelta
 
 # Configure logging
 logging.basicConfig(
@@ -18,6 +19,79 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger("portfolio-api")
+
+# Minimum observations required for statistical validity
+MIN_OBSERVATIONS = {
+    'monthly': 36,   # 3 years
+    'weekly': 156,   # 3 years
+    'daily': 756     # 3 years
+}
+
+
+def calculate_adjusted_dates(
+    start_date: str,
+    end_date: str,
+    frequency: str
+) -> Tuple[str, str, bool, str]:
+    """
+    Calculate adjusted start date to ensure minimum observations for factor analysis.
+
+    For monthly frequency, we need at least 36 observations (3 years).
+    If the requested period is shorter, we extend the start date.
+
+    Args:
+        start_date: Requested start date (YYYY-MM-DD)
+        end_date: Requested end date (YYYY-MM-DD)
+        frequency: 'daily', 'weekly', or 'monthly'
+
+    Returns:
+        Tuple of (adjusted_start_date, end_date, was_adjusted, adjustment_message)
+    """
+    start_dt = pd.Timestamp(start_date)
+    end_dt = pd.Timestamp(end_date)
+
+    # Calculate requested period in years
+    requested_days = (end_dt - start_dt).days
+    requested_years = requested_days / 365.25
+
+    # Minimum years needed based on frequency
+    min_years_needed = {
+        'monthly': 3.0,   # 36 months minimum
+        'weekly': 3.0,    # 156 weeks minimum
+        'daily': 3.0      # 756 days minimum
+    }
+
+    min_years = min_years_needed.get(frequency, 3.0)
+    was_adjusted = False
+    adjustment_message = None
+
+    if requested_years < min_years:
+        # Need to extend the start date
+        was_adjusted = True
+
+        # Add buffer for alignment issues
+        buffer_months = 3 if frequency == 'monthly' else 6
+
+        # Calculate new start date
+        adjusted_start_dt = end_dt - relativedelta(years=int(min_years), months=buffer_months)
+
+        # Ensure we don't go before a reasonable date (1990)
+        earliest_allowed = pd.Timestamp('1990-01-01')
+        if adjusted_start_dt < earliest_allowed:
+            adjusted_start_dt = earliest_allowed
+
+        adjusted_start_date = adjusted_start_dt.strftime('%Y-%m-%d')
+        adjustment_message = (
+            f"Requested period ({requested_years:.1f} years) extended to {min_years:.0f} years "
+            f"to meet minimum {MIN_OBSERVATIONS[frequency]} {frequency} observations requirement"
+        )
+
+        logger.info(f"Date adjustment: {start_date} -> {adjusted_start_date} ({adjustment_message})")
+
+        return adjusted_start_date, end_date, was_adjusted, adjustment_message
+
+    return start_date, end_date, was_adjusted, adjustment_message
+
 
 def safe_float(value, default=0.0):
     """
@@ -1327,12 +1401,19 @@ async def analyze_factors_endpoint(request: FactorAnalysisRequest):
                 detail=f"risk_free_rate must be one of {valid_rf_rates}. Got: {request.risk_free_rate}"
             )
 
-        # Call the factor analysis function
+        # Adjust dates to ensure minimum observations
+        adjusted_start_date, adjusted_end_date, was_adjusted, adjustment_message = calculate_adjusted_dates(
+            request.start_date,
+            request.end_date,
+            request.frequency
+        )
+
+        # Call the factor analysis function with adjusted dates
         if has_single_ticker:
             result = analyze_factors(
                 ticker=request.ticker.strip().upper(),
-                start_date=request.start_date,
-                end_date=request.end_date,
+                start_date=adjusted_start_date,
+                end_date=adjusted_end_date,
                 factor_model=request.factor_model,
                 frequency=request.frequency,
                 risk_free_rate=request.risk_free_rate
@@ -1341,12 +1422,21 @@ async def analyze_factors_endpoint(request: FactorAnalysisRequest):
             result = analyze_factors(
                 tickers=[t.strip().upper() for t in request.tickers],
                 weights=request.weights,
-                start_date=request.start_date,
-                end_date=request.end_date,
+                start_date=adjusted_start_date,
+                end_date=adjusted_end_date,
                 factor_model=request.factor_model,
                 frequency=request.frequency,
                 risk_free_rate=request.risk_free_rate
             )
+
+        # Add date adjustment info to response
+        if was_adjusted:
+            result['period']['requested_start'] = request.start_date
+            result['period']['requested_end'] = request.end_date
+            result['period']['was_adjusted'] = True
+            result['period']['adjustment_reason'] = adjustment_message
+        else:
+            result['period']['was_adjusted'] = False
 
         return {
             "success": True,
