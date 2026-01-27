@@ -147,7 +147,13 @@ def get_factors(start_date, end_date, _version=2, include_5_factor=True, include
         # Ensure we have a DataFrame
         if not isinstance(factors_df, pd.DataFrame):
             raise ValueError(f"Unexpected data format from pandas_datareader: {type(factors_df)}")
-        
+
+        # CRITICAL: Convert PeriodIndex to DatetimeIndex immediately
+        # Fama-French data comes with PeriodIndex (e.g., Period('2021-02', 'M'))
+        # We need DatetimeIndex for proper alignment with ticker returns
+        if isinstance(factors_df.index, pd.PeriodIndex):
+            factors_df.index = factors_df.index.to_timestamp()
+
         # Verify we got monthly data (not daily)
         # Monthly data should have fewer than 200 rows for a 5-year period
         # Daily data would have 1000+ rows
