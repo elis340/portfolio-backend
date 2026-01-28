@@ -761,9 +761,24 @@ def analyze_factors(
     alpha_contribution = float(alpha * num_observations)
     factor_contributions['alpha'] = alpha_contribution
 
+    # Risk-free rate contribution - THE MISSING PIECE!
+    # Total return = excess returns + risk-free rate
+    # We calculated contributions from excess returns (Mkt-RF, SMB, etc.)
+    # Now add the risk-free rate contribution to complete the attribution
+    if 'RF' in aligned_data.columns:
+        rf_contribution = float(aligned_data['RF'].sum())
+        factor_contributions['risk_free'] = rf_contribution
+        logger.debug(f"RF contribution: {rf_contribution:.6f}")
+    else:
+        logger.warning("Risk-free rate (RF) not found in aligned data")
+        factor_contributions['risk_free'] = 0.0
+
     # Log total attribution for verification
     total_contributions = sum(factor_contributions.values())
-    logger.info(f"Total factor contributions: {total_contributions:.6f} vs actual total return: {total_return:.6f}")
+    logger.info(f"Total factor contributions (incl RF): {total_contributions:.6f} vs actual total return: {total_return:.6f}")
+    residual = total_return - total_contributions
+    if abs(residual) > 0.001:
+        logger.warning(f"Attribution residual: {residual:.6f} (contributions don't sum to total return)")
 
     # Risk contribution (variance decomposition using Euler allocation)
     # This properly accounts for covariances between factors
