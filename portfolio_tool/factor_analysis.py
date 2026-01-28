@@ -735,38 +735,38 @@ def analyze_factors(
     # Annualized standard deviation
     annualized_std = float(aligned_data['returns'].std() * np.sqrt(periods_per_year))
 
-    # Factor contributions to return
+    # Factor contributions to return - DYNAMIC calculation
     # Contribution = beta * sum of factor returns over period
-    market_contribution = 0.0
-    smb_contribution = 0.0
-    hml_contribution = 0.0
-    mom_contribution = 0.0
-    rmw_contribution = 0.0
-    cma_contribution = 0.0
+    # Map factor column names to contribution keys
+    factor_contribution_map = {
+        'Mkt-RF': 'market',
+        'SMB': 'smb',
+        'HML': 'hml',
+        'MOM': 'mom',
+        'RMW': 'rmw',
+        'CMA': 'cma'
+    }
 
-    if 'Mkt-RF' in required_factors:
-        idx = required_factors.index('Mkt-RF')
-        market_contribution = float(factor_loadings[idx] * aligned_data['Mkt-RF'].sum())
-    if 'SMB' in required_factors:
-        idx = required_factors.index('SMB')
-        smb_contribution = float(factor_loadings[idx] * aligned_data['SMB'].sum())
-    if 'HML' in required_factors:
-        idx = required_factors.index('HML')
-        hml_contribution = float(factor_loadings[idx] * aligned_data['HML'].sum())
-    if 'MOM' in required_factors:
-        idx = required_factors.index('MOM')
-        mom_contribution = float(factor_loadings[idx] * aligned_data['MOM'].sum())
-    if 'RMW' in required_factors:
-        idx = required_factors.index('RMW')
-        rmw_contribution = float(factor_loadings[idx] * aligned_data['RMW'].sum())
-    if 'CMA' in required_factors:
-        idx = required_factors.index('CMA')
-        cma_contribution = float(factor_loadings[idx] * aligned_data['CMA'].sum())
+    # Calculate contributions dynamically for all factors in the model
+    factor_contributions = {}
+    for factor_col in required_factors:
+        if factor_col in factor_contribution_map:
+            idx = required_factors.index(factor_col)
+            contribution_key = factor_contribution_map[factor_col]
+            contribution_value = float(factor_loadings[idx] * aligned_data[factor_col].sum())
+            factor_contributions[contribution_key] = contribution_value
+            logger.debug(f"{factor_col} contribution: {contribution_value:.6f}")
 
     # Alpha contribution = alpha * number of periods
     alpha_contribution = float(alpha * num_observations)
+    factor_contributions['alpha'] = alpha_contribution
 
-    # Risk contribution (variance decomposition)
+    # Log total attribution for verification
+    total_contributions = sum(factor_contributions.values())
+    logger.info(f"Total factor contributions: {total_contributions:.6f} vs actual total return: {total_return:.6f}")
+
+    # Risk contribution (variance decomposition using Euler allocation)
+    # This properly accounts for covariances between factors
     total_var = aligned_data['returns'].var()
     residual_var = float(np.var(residuals))
 
@@ -774,51 +774,51 @@ def analyze_factors(
     risk_contribution = {}
 
     if total_var > 0:
-        # Market risk contribution
-        if 'Mkt-RF' in required_factors:
-            idx = required_factors.index('Mkt-RF')
-            market_std = aligned_data['Mkt-RF'].std()
-            market_risk = (factor_loadings[idx] * market_std) ** 2 / total_var
-            risk_contribution['market_risk'] = round(float(market_risk), 4)
+        # Get covariance matrix for factors
+        factor_data = aligned_data[required_factors]
+        factor_cov_matrix = factor_data.cov()
 
-        # SMB risk contribution
-        if 'SMB' in required_factors:
-            idx = required_factors.index('SMB')
-            smb_std = aligned_data['SMB'].std()
-            smb_risk = (factor_loadings[idx] * smb_std) ** 2 / total_var
-            risk_contribution['smb_risk'] = round(float(smb_risk), 4)
+        # Map factor columns to risk keys
+        factor_risk_map = {
+            'Mkt-RF': 'market_risk',
+            'SMB': 'smb_risk',
+            'HML': 'hml_risk',
+            'MOM': 'mom_risk',
+            'RMW': 'rmw_risk',
+            'CMA': 'cma_risk'
+        }
 
-        # HML risk contribution
-        if 'HML' in required_factors:
-            idx = required_factors.index('HML')
-            hml_std = aligned_data['HML'].std()
-            hml_risk = (factor_loadings[idx] * hml_std) ** 2 / total_var
-            risk_contribution['hml_risk'] = round(float(hml_risk), 4)
+        # Calculate marginal contribution to variance for each factor (Euler allocation)
+        # Risk_i = (β_i × Σ(β_j × Cov(i,j))) / σ²_portfolio
+        for i, factor_i in enumerate(required_factors):
+            if factor_i not in factor_risk_map:
+                continue
 
-        # MOM risk contribution (if applicable)
-        if 'MOM' in required_factors:
-            idx = required_factors.index('MOM')
-            mom_std = aligned_data['MOM'].std()
-            mom_risk = (factor_loadings[idx] * mom_std) ** 2 / total_var
-            risk_contribution['mom_risk'] = round(float(mom_risk), 4)
+            beta_i = factor_loadings[i]
 
-        # RMW risk contribution (if applicable)
-        if 'RMW' in required_factors:
-            idx = required_factors.index('RMW')
-            rmw_std = aligned_data['RMW'].std()
-            rmw_risk = (factor_loadings[idx] * rmw_std) ** 2 / total_var
-            risk_contribution['rmw_risk'] = round(float(rmw_risk), 4)
+            # Calculate marginal contribution: sum over all factors (including itself)
+            marginal_contrib = 0.0
+            for j, factor_j in enumerate(required_factors):
+                beta_j = factor_loadings[j]
+                cov_ij = factor_cov_matrix.loc[factor_i, factor_j]
+                marginal_contrib += beta_j * cov_ij
 
-        # CMA risk contribution (if applicable)
-        if 'CMA' in required_factors:
-            idx = required_factors.index('CMA')
-            cma_std = aligned_data['CMA'].std()
-            cma_risk = (factor_loadings[idx] * cma_std) ** 2 / total_var
-            risk_contribution['cma_risk'] = round(float(cma_risk), 4)
+            # Risk contribution as fraction of total variance
+            risk_contrib = (beta_i * marginal_contrib) / total_var
+            risk_key = factor_risk_map[factor_i]
+            risk_contribution[risk_key] = round(float(risk_contrib), 4)
+            logger.debug(f"{factor_i} risk contribution: {risk_contrib:.6f}")
 
         # Alpha (idiosyncratic) risk contribution
-        alpha_risk = residual_var / total_var
+        # This is the residual: 1.0 minus sum of all factor risks
+        total_factor_risk = sum(risk_contribution.values())
+        alpha_risk = 1.0 - total_factor_risk
         risk_contribution['alpha_risk'] = round(float(alpha_risk), 4)
+
+        # Verify risk contributions sum to 1.0 (100%)
+        total_risk_check = sum(risk_contribution.values())
+        logger.info(f"Risk contributions sum to: {total_risk_check:.6f} (should be ~1.0)")
+
     else:
         # Handle edge case of zero variance
         risk_contribution = {
@@ -952,22 +952,19 @@ def analyze_factors(
             "total_return": round(total_return, 4),
             "annualized_return": round(annualized_return, 4),
             "annualized_std": round(annualized_std, 4),
-            "market_contribution": round(market_contribution, 4),
-            "smb_contribution": round(smb_contribution, 4),
-            "hml_contribution": round(hml_contribution, 4),
-            "alpha_contribution": round(alpha_contribution, 4),
             "risk_contribution": risk_contribution
         },
         "time_series": time_series
     }
 
-    # Add additional factor contributions if using extended models
-    if 'MOM' in required_factors:
-        result["return_attribution"]["mom_contribution"] = round(mom_contribution, 4)
-    if 'RMW' in required_factors:
-        result["return_attribution"]["rmw_contribution"] = round(rmw_contribution, 4)
-    if 'CMA' in required_factors:
-        result["return_attribution"]["cma_contribution"] = round(cma_contribution, 4)
+    # Add factor contributions dynamically with proper suffixes
+    # Extract alpha separately (it's already in factor_contributions)
+    for key, value in factor_contributions.items():
+        if key == 'alpha':
+            result["return_attribution"]["alpha_contribution"] = round(value, 4)
+        else:
+            # Add with _contribution suffix (e.g., market -> market_contribution)
+            result["return_attribution"][f"{key}_contribution"] = round(value, 4)
     
     # Add frequency-specific alpha if not monthly
     if frequency == 'daily':
