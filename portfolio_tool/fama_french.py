@@ -29,7 +29,7 @@ except Exception as e:
 
 
 @lru_cache(maxsize=32)
-def get_factors(start_date, end_date, _version=2, include_5_factor=True, include_momentum=True):
+def get_factors(start_date, end_date, _version=2, include_5_factor=True, include_momentum=True, use_3month_tbill=True):
     """
     Fetch Fama-French factor data from Kenneth French's data library.
 
@@ -37,10 +37,20 @@ def get_factors(start_date, end_date, _version=2, include_5_factor=True, include
     - Mkt-RF: Market excess return (market return minus risk-free rate)
     - SMB: Small Minus Big (size factor - small cap outperformance)
     - HML: High Minus Low (value factor - value stock outperformance)
-    - RF: Risk-free rate
+    - RF: Risk-free rate (1-month T-Bill from Kenneth French, or 3-month T-Bill from FRED)
     - RMW: Robust Minus Weak (profitability factor) [5-factor]
     - CMA: Conservative Minus Aggressive (investment factor) [5-factor]
     - MOM: Momentum factor [Carhart 4-factor]
+
+    IMPORTANT: Risk-Free Rate Source
+    - Kenneth French's original RF column uses 1-month Treasury Bills
+    - Portfolio Visualizer uses 3-month Treasury Bills from FRED
+    - By default (use_3month_tbill=True), we fetch 3-month T-Bills from FRED to match
+      Portfolio Visualizer's methodology
+    - Set use_3month_tbill=False to use Kenneth French's original 1-month T-Bill rate
+
+    Source: Kenneth French Data Library
+    https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/data_library.html
 
     Args:
         start_date: Start date as string (YYYY-MM-DD) or pandas Timestamp
@@ -241,7 +251,55 @@ def get_factors(start_date, end_date, _version=2, include_5_factor=True, include
 
             except Exception as e:
                 warnings.warn(f"Could not fetch momentum factor: {e}. Proceeding without MOM.")
-        
+
+        # Fetch 3-month T-Bill from FRED if requested
+        # Kenneth French's RF column uses 1-month T-Bills
+        # Portfolio Visualizer uses 3-month T-Bills (DTB3 from FRED)
+        if use_3month_tbill and 'RF' in factors_df.columns:
+            try:
+                # Fetch 3-month T-Bill rate from FRED
+                # DTB3 = 3-Month Treasury Bill: Secondary Market Rate
+                # Data is daily, in percent (e.g., 4.5 for 4.5%)
+                tbill_3m = web.DataReader('DTB3', 'fred', start=start_date, end=end_date)
+
+                # Convert PeriodIndex to DatetimeIndex if needed
+                if isinstance(tbill_3m.index, pd.PeriodIndex):
+                    tbill_3m.index = tbill_3m.index.to_timestamp()
+
+                # DTB3 is daily, resample to monthly (take last value of each month)
+                # Use 'ME' for month-end
+                tbill_3m_monthly = tbill_3m.resample('ME').last()
+
+                # Convert from annual percentage to monthly decimal
+                # DTB3 is annualized rate (e.g., 4.5%), convert to monthly decimal
+                # Formula: (1 + annual_rate/100)^(1/12) - 1
+                tbill_3m_monthly_decimal = ((1 + tbill_3m_monthly / 100) ** (1/12)) - 1
+
+                # Rename column to RF
+                tbill_3m_monthly_decimal.columns = ['RF_3M']
+
+                # Replace Kenneth French's 1-month RF with 3-month RF
+                # Join and fill missing values with original RF if needed
+                factors_df = factors_df.join(tbill_3m_monthly_decimal['RF_3M'], how='left')
+
+                # Replace RF with RF_3M where available, keep original RF as fallback
+                factors_df['RF_1M'] = factors_df['RF']  # Save original 1-month rate
+                factors_df['RF'] = factors_df['RF_3M'].fillna(factors_df['RF_1M'])
+                factors_df = factors_df.drop(columns=['RF_3M'])  # Clean up
+
+                warnings.warn(
+                    "Using 3-month T-Bill from FRED (DTB3) as risk-free rate to match Portfolio Visualizer. "
+                    "Original 1-month T-Bill from Kenneth French saved as RF_1M.",
+                    UserWarning
+                )
+
+            except Exception as e:
+                warnings.warn(
+                    f"Could not fetch 3-month T-Bill from FRED: {e}. "
+                    f"Using Kenneth French's 1-month T-Bill instead.",
+                    UserWarning
+                )
+
         # Ensure index is DatetimeIndex
         if not isinstance(factors_df.index, pd.DatetimeIndex):
             try:
