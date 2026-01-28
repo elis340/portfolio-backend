@@ -748,34 +748,42 @@ def analyze_factors(
     }
 
     # Calculate contributions dynamically for all factors in the model
+    # IMPORTANT: Portfolio Visualizer uses TOTAL returns (including RF) for market attribution
+    # Standard Fama-French uses EXCESS returns (Mkt-RF)
+    # We need to add RF back to get total market returns for proper attribution
     factor_contributions = {}
     for factor_col in required_factors:
         if factor_col in factor_contribution_map:
             idx = required_factors.index(factor_col)
             contribution_key = factor_contribution_map[factor_col]
-            contribution_value = float(factor_loadings[idx] * aligned_data[factor_col].sum())
+
+            # Special handling for market factor: use total returns not excess returns
+            if factor_col == 'Mkt-RF' and 'RF' in aligned_data.columns:
+                # Market contribution = β_market × Σ(Mkt-RF + RF)
+                # This converts excess returns back to total returns
+                total_market_returns = aligned_data['Mkt-RF'] + aligned_data['RF']
+                contribution_value = float(factor_loadings[idx] * total_market_returns.sum())
+                logger.debug(f"Market contribution (using total returns): {contribution_value:.6f}")
+            else:
+                # Other factors use excess returns as-is (SMB, HML, etc.)
+                contribution_value = float(factor_loadings[idx] * aligned_data[factor_col].sum())
+                logger.debug(f"{factor_col} contribution: {contribution_value:.6f}")
+
             factor_contributions[contribution_key] = contribution_value
-            logger.debug(f"{factor_col} contribution: {contribution_value:.6f}")
 
     # Alpha contribution = alpha * number of periods
     alpha_contribution = float(alpha * num_observations)
     factor_contributions['alpha'] = alpha_contribution
 
-    # Risk-free rate contribution - THE MISSING PIECE!
-    # Total return = excess returns + risk-free rate
-    # We calculated contributions from excess returns (Mkt-RF, SMB, etc.)
-    # Now add the risk-free rate contribution to complete the attribution
-    if 'RF' in aligned_data.columns:
-        rf_contribution = float(aligned_data['RF'].sum())
-        factor_contributions['risk_free'] = rf_contribution
-        logger.debug(f"RF contribution: {rf_contribution:.6f}")
-    else:
-        logger.warning("Risk-free rate (RF) not found in aligned data")
-        factor_contributions['risk_free'] = 0.0
+    # NOTE: We do NOT add a separate RF contribution here!
+    # Portfolio Visualizer's methodology includes RF in the market contribution:
+    # - Market contribution = β_market × Σ(Mkt-RF + RF) = β_market × Σ(total market returns)
+    # - This already includes the risk-free rate component
+    # - Adding a separate RF contribution would DOUBLE-COUNT the risk-free rate
 
     # Log total attribution for verification
     total_contributions = sum(factor_contributions.values())
-    logger.info(f"Total factor contributions (incl RF): {total_contributions:.6f} vs actual total return: {total_return:.6f}")
+    logger.info(f"Total factor contributions: {total_contributions:.6f} vs actual total return: {total_return:.6f}")
     residual = total_return - total_contributions
     if abs(residual) > 0.001:
         logger.warning(f"Attribution residual: {residual:.6f} (contributions don't sum to total return)")
