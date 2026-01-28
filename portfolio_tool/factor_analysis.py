@@ -599,7 +599,7 @@ def analyze_factors(
     try:
         factors = get_factors(
             start_date, end_date,
-            _version=3,  # Bump version to clear cache after 3-month T-Bill changes
+            _version=4,  # Bump version to clear cache after compounding calculation changes
             include_5_factor=include_5_factor or True,  # Always fetch 5-factor for flexibility
             include_momentum=include_momentum or True,    # Always fetch momentum for flexibility
             use_3month_tbill=True  # Explicitly use 3-month T-Bills to match Portfolio Visualizer
@@ -777,18 +777,40 @@ def analyze_factors(
                 total_market_returns = aligned_data['Mkt-RF'] + aligned_data['RF']
                 total_market_sum = float(total_market_returns.sum())
                 beta_market = float(factor_loadings[idx])
-                contribution_value = beta_market * total_market_sum
 
-                # Detailed logging for debugging
-                logger.info(f"=== MARKET CONTRIBUTION DEBUG ===")
+                # METHOD 1: LINEAR SUMMATION (current approach)
+                linear_contribution = beta_market * total_market_sum
+
+                # METHOD 2: GEOMETRIC COMPOUNDING (Portfolio Visualizer hypothesis)
+                # Calculate monthly contributions: β × (Mkt-RF_t + RF_t) for each month
+                monthly_contribs = beta_market * total_market_returns
+                # Compound geometrically: Π(1 + r_t) - 1
+                compounded_contribution = float((1 + monthly_contribs).prod() - 1)
+
+                # Detailed logging for debugging - compare both methods
+                logger.info(f"=== MARKET CONTRIBUTION COMPARISON ===")
                 logger.info(f"Beta (market): {beta_market:.6f}")
                 logger.info(f"Σ(Mkt-RF): {mkt_rf_sum:.6f}")
                 logger.info(f"Σ(RF): {rf_sum:.6f}")
                 logger.info(f"Σ(Mkt-RF + RF): {total_market_sum:.6f}")
-                logger.info(f"Market contribution = {beta_market:.6f} × {total_market_sum:.6f} = {contribution_value:.6f}")
-                logger.info(f"=== END DEBUG ===")
+                logger.info(f"")
+                logger.info(f"METHOD 1 - LINEAR SUMMATION:")
+                logger.info(f"  Formula: β × Σ(Mkt-RF + RF)")
+                logger.info(f"  Calculation: {beta_market:.6f} × {total_market_sum:.6f}")
+                logger.info(f"  Result: {linear_contribution:.6f} ({linear_contribution*100:.2f}%)")
+                logger.info(f"")
+                logger.info(f"METHOD 2 - GEOMETRIC COMPOUNDING:")
+                logger.info(f"  Formula: Π(1 + β × (Mkt-RF_t + RF_t)) - 1")
+                logger.info(f"  Monthly contributions sample (first 5):")
+                for i, (date, val) in enumerate(monthly_contribs.head().items()):
+                    logger.info(f"    {date.strftime('%Y-%m')}: {val:.6f}")
+                logger.info(f"  Result: {compounded_contribution:.6f} ({compounded_contribution*100:.2f}%)")
+                logger.info(f"")
+                logger.info(f"DIFFERENCE: {abs(compounded_contribution - linear_contribution):.6f} ({abs(compounded_contribution - linear_contribution)*100:.2f}%)")
+                logger.info(f"=== END COMPARISON ===")
 
-                contribution_value = float(contribution_value)
+                # Use compounding method (hypothesis: this matches Portfolio Visualizer)
+                contribution_value = float(compounded_contribution)
             elif factor_col == 'Mkt-RF':
                 # Market factor but RF not available - use excess returns only
                 mkt_rf_only = float(aligned_data['Mkt-RF'].sum())
@@ -797,14 +819,39 @@ def analyze_factors(
                 logger.warning(f"!!! RF NOT IN ALIGNED_DATA - using Mkt-RF only !!!")
                 logger.warning(f"Market contribution (without RF) = {beta_market:.6f} × {mkt_rf_only:.6f} = {contribution_value:.6f}")
             else:
-                # Other factors use excess returns as-is (SMB, HML, etc.)
-                contribution_value = float(factor_loadings[idx] * aligned_data[factor_col].sum())
-                logger.debug(f"{factor_col} contribution: {contribution_value:.6f}")
+                # Other factors (SMB, HML, MOM, RMW, CMA) use excess returns as-is
+                # Apply geometric compounding for consistency with market calculation
+                beta_factor = float(factor_loadings[idx])
+
+                # LINEAR (old method): β × Σ(factor)
+                linear_contribution = beta_factor * aligned_data[factor_col].sum()
+
+                # COMPOUNDING (new method): Π(1 + β × factor_t) - 1
+                monthly_contribs = beta_factor * aligned_data[factor_col]
+                compounded_contribution = float((1 + monthly_contribs).prod() - 1)
+
+                logger.debug(f"{factor_col} contribution - Linear: {linear_contribution:.6f}, Compounded: {compounded_contribution:.6f}")
+
+                # Use compounding method
+                contribution_value = float(compounded_contribution)
 
             factor_contributions[contribution_key] = contribution_value
 
-    # Alpha contribution = alpha * number of periods
-    alpha_contribution = float(alpha * num_observations)
+    # Alpha contribution
+    # LINEAR (old): alpha × num_periods
+    # COMPOUNDING (new): (1 + alpha)^num_periods - 1
+    linear_alpha = float(alpha * num_observations)
+    compounded_alpha = float((1 + alpha) ** num_observations - 1)
+
+    logger.info(f"=== ALPHA CONTRIBUTION ===")
+    logger.info(f"Alpha per period: {alpha:.6f}")
+    logger.info(f"Number of periods: {num_observations}")
+    logger.info(f"Linear: {linear_alpha:.6f} ({linear_alpha*100:.2f}%)")
+    logger.info(f"Compounded: {compounded_alpha:.6f} ({compounded_alpha*100:.2f}%)")
+    logger.info(f"=== END ALPHA ===")
+
+    # Use compounding method
+    alpha_contribution = compounded_alpha
     factor_contributions['alpha'] = alpha_contribution
 
     # NOTE: We do NOT add a separate RF contribution here!
