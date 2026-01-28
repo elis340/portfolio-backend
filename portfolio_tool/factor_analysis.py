@@ -599,8 +599,10 @@ def analyze_factors(
     try:
         factors = get_factors(
             start_date, end_date,
+            _version=3,  # Bump version to clear cache after 3-month T-Bill changes
             include_5_factor=include_5_factor or True,  # Always fetch 5-factor for flexibility
-            include_momentum=include_momentum or True    # Always fetch momentum for flexibility
+            include_momentum=include_momentum or True,    # Always fetch momentum for flexibility
+            use_3month_tbill=True  # Explicitly use 3-month T-Bills to match Portfolio Visualizer
         )
     except Exception as e:
         raise ConnectionError(f"Failed to fetch Fama-French data: {str(e)}") from e
@@ -751,6 +753,15 @@ def analyze_factors(
     # IMPORTANT: Portfolio Visualizer uses TOTAL returns (including RF) for market attribution
     # Standard Fama-French uses EXCESS returns (Mkt-RF)
     # We need to add RF back to get total market returns for proper attribution
+
+    # Debug: Check if RF is in aligned_data
+    logger.info(f"=== RETURN ATTRIBUTION SETUP ===")
+    logger.info(f"aligned_data columns: {aligned_data.columns.tolist()}")
+    logger.info(f"RF in columns: {'RF' in aligned_data.columns}")
+    if 'RF' in aligned_data.columns:
+        logger.info(f"RF values - mean: {aligned_data['RF'].mean():.6f}, sum: {aligned_data['RF'].sum():.6f}")
+        logger.info(f"RF has NaN: {aligned_data['RF'].isna().any()}, NaN count: {aligned_data['RF'].isna().sum()}")
+
     factor_contributions = {}
     for factor_col in required_factors:
         if factor_col in factor_contribution_map:
@@ -778,6 +789,13 @@ def analyze_factors(
                 logger.info(f"=== END DEBUG ===")
 
                 contribution_value = float(contribution_value)
+            elif factor_col == 'Mkt-RF':
+                # Market factor but RF not available - use excess returns only
+                mkt_rf_only = float(aligned_data['Mkt-RF'].sum())
+                beta_market = float(factor_loadings[idx])
+                contribution_value = beta_market * mkt_rf_only
+                logger.warning(f"!!! RF NOT IN ALIGNED_DATA - using Mkt-RF only !!!")
+                logger.warning(f"Market contribution (without RF) = {beta_market:.6f} × {mkt_rf_only:.6f} = {contribution_value:.6f}")
             else:
                 # Other factors use excess returns as-is (SMB, HML, etc.)
                 contribution_value = float(factor_loadings[idx] * aligned_data[factor_col].sum())
