@@ -761,9 +761,23 @@ def analyze_factors(
             if factor_col == 'Mkt-RF' and 'RF' in aligned_data.columns:
                 # Market contribution = β_market × Σ(Mkt-RF + RF)
                 # This converts excess returns back to total returns
+                mkt_rf_sum = float(aligned_data['Mkt-RF'].sum())
+                rf_sum = float(aligned_data['RF'].sum())
                 total_market_returns = aligned_data['Mkt-RF'] + aligned_data['RF']
-                contribution_value = float(factor_loadings[idx] * total_market_returns.sum())
-                logger.debug(f"Market contribution (using total returns): {contribution_value:.6f}")
+                total_market_sum = float(total_market_returns.sum())
+                beta_market = float(factor_loadings[idx])
+                contribution_value = beta_market * total_market_sum
+
+                # Detailed logging for debugging
+                logger.info(f"=== MARKET CONTRIBUTION DEBUG ===")
+                logger.info(f"Beta (market): {beta_market:.6f}")
+                logger.info(f"Σ(Mkt-RF): {mkt_rf_sum:.6f}")
+                logger.info(f"Σ(RF): {rf_sum:.6f}")
+                logger.info(f"Σ(Mkt-RF + RF): {total_market_sum:.6f}")
+                logger.info(f"Market contribution = {beta_market:.6f} × {total_market_sum:.6f} = {contribution_value:.6f}")
+                logger.info(f"=== END DEBUG ===")
+
+                contribution_value = float(contribution_value)
             else:
                 # Other factors use excess returns as-is (SMB, HML, etc.)
                 contribution_value = float(factor_loadings[idx] * aligned_data[factor_col].sum())
