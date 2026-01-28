@@ -803,22 +803,21 @@ def analyze_factors(
                 cov_ij = factor_cov_matrix.loc[factor_i, factor_j]
                 marginal_contrib += beta_j * cov_ij
 
-            # Risk contribution as fraction of total variance, then convert to percentage
+            # Risk contribution as fraction of total variance
             risk_contrib = (beta_i * marginal_contrib) / total_var
             risk_key = factor_risk_map[factor_i]
-            # Express as percentage (multiply by 100)
-            risk_contribution[risk_key] = round(float(risk_contrib * 100), 2)
-            logger.debug(f"{factor_i} risk contribution: {risk_contrib * 100:.2f}%")
+            risk_contribution[risk_key] = round(float(risk_contrib), 4)
+            logger.debug(f"{factor_i} risk contribution: {risk_contrib:.6f}")
 
         # Alpha (idiosyncratic) risk contribution
-        # This is the residual: 100% minus sum of all factor risks
+        # This is the residual: 1.0 minus sum of all factor risks
         total_factor_risk = sum(risk_contribution.values())
-        alpha_risk = 100.0 - total_factor_risk
-        risk_contribution['alpha_risk'] = round(float(alpha_risk), 2)
+        alpha_risk = 1.0 - total_factor_risk
+        risk_contribution['alpha_risk'] = round(float(alpha_risk), 4)
 
-        # Verify risk contributions sum to 100%
+        # Verify risk contributions sum to 1.0 (100%)
         total_risk_check = sum(risk_contribution.values())
-        logger.info(f"Risk contributions sum to: {total_risk_check:.2f}% (should be 100%)")
+        logger.info(f"Risk contributions sum to: {total_risk_check:.6f} (should be ~1.0)")
 
     else:
         # Handle edge case of zero variance
@@ -950,37 +949,22 @@ def analyze_factors(
         },
         "factor_premiums": factor_premiums,
         "return_attribution": {
-            "total_return": round(total_return * 100, 2),  # Express as percentage
-            "annualized_return": round(annualized_return * 100, 2),  # Express as percentage
-            "annualized_std": round(annualized_std * 100, 2),  # Express as percentage
+            "total_return": round(total_return, 4),
+            "annualized_return": round(annualized_return, 4),
+            "annualized_std": round(annualized_std, 4),
             "risk_contribution": risk_contribution
         },
         "time_series": time_series
     }
 
-    # Add factor contributions dynamically as percentages of total return
-    # This ensures all contributions sum to 100%
-    # Formula: contribution_pct = (raw_contribution / total_return) × 100
-    if total_return != 0:
-        for key, value in factor_contributions.items():
-            # Normalize each contribution as percentage of total return
-            contribution_pct = (value / total_return) * 100
-            if key == 'alpha':
-                result["return_attribution"]["alpha_contribution"] = round(contribution_pct, 2)
-            else:
-                # Add with _contribution suffix (e.g., market -> market_contribution)
-                result["return_attribution"][f"{key}_contribution"] = round(contribution_pct, 2)
-
-        # Log for verification
-        total_contrib_pct = sum((v / total_return) * 100 for v in factor_contributions.values())
-        logger.info(f"Return contributions sum to: {total_contrib_pct:.2f}% (should be 100%)")
-    else:
-        # Handle edge case of zero total return
-        for key in factor_contributions.keys():
-            if key == 'alpha':
-                result["return_attribution"]["alpha_contribution"] = 0.0
-            else:
-                result["return_attribution"][f"{key}_contribution"] = 0.0
+    # Add factor contributions dynamically with proper suffixes
+    # Extract alpha separately (it's already in factor_contributions)
+    for key, value in factor_contributions.items():
+        if key == 'alpha':
+            result["return_attribution"]["alpha_contribution"] = round(value, 4)
+        else:
+            # Add with _contribution suffix (e.g., market -> market_contribution)
+            result["return_attribution"][f"{key}_contribution"] = round(value, 4)
     
     # Add frequency-specific alpha if not monthly
     if frequency == 'daily':
