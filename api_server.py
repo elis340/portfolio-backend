@@ -2,7 +2,7 @@
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Dict, Optional, Tuple
 import pandas as pd
 import numpy as np
@@ -379,6 +379,54 @@ class FactorAnalysisRequest(BaseModel):
     factor_model: str = "3-factor"  # Options: "3-factor", "5-factor", "4-factor", "CAPM"
     frequency: str = "monthly"  # Options: "daily", "weekly", "monthly"
     risk_free_rate: str = "1M_TBILL"  # Options: "1M_TBILL", "3M_TBILL"
+
+
+class AbsoluteView(BaseModel):
+    """Absolute view: belief about a single asset's expected return."""
+    model_config = {"populate_by_name": True}
+
+    asset: str  # Ticker symbol
+    return_: float = Field(alias="return")  # Expected annual return (e.g., 0.15 for 15%)
+    confidence: float  # Confidence in view (0.0 to 1.0)
+
+
+class RelativeView(BaseModel):
+    """Relative view: belief that one asset will outperform another."""
+    asset1: str  # Ticker that will outperform
+    asset2: str  # Ticker that will underperform
+    outperformance: float  # Expected outperformance (e.g., 0.03 for 3%)
+    confidence: float  # Confidence in view (0.0 to 1.0)
+
+
+class ViewsInput(BaseModel):
+    """Container for investor views."""
+    absolute: Optional[List[AbsoluteView]] = []
+    relative: Optional[List[RelativeView]] = []
+
+
+class BlackLittermanRequest(BaseModel):
+    """
+    Request body for Black-Litterman portfolio optimization.
+
+    The Black-Litterman model combines market equilibrium with investor views
+    to produce optimal portfolio weights.
+
+    Attributes:
+        tickers: List of ticker symbols to include in the portfolio
+        start_date: Start date for historical data (YYYY-MM-DD)
+        end_date: End date for historical data (YYYY-MM-DD)
+        market_caps: Market capitalizations for each ticker (in dollars)
+        views: Investor views (absolute and/or relative)
+        risk_aversion: Risk aversion coefficient (higher = more conservative, default 2.5)
+        risk_free_rate: Annual risk-free rate (default 0.04 for 4%)
+    """
+    tickers: List[str]
+    start_date: str
+    end_date: str
+    market_caps: Dict[str, float]
+    views: Optional[ViewsInput] = None
+    risk_aversion: float = 2.5
+    risk_free_rate: float = 0.04
 
 
 def parse_portfolio_text(portfolio_text: str) -> pd.DataFrame:
@@ -1505,6 +1553,269 @@ async def analyze_factors_endpoint(request: FactorAnalysisRequest):
             status_code=500,
             detail=f"Factor analysis error: {error_detail}. "
                   f"Please check your inputs and try again. If the problem persists, contact support."
+        )
+
+
+@app.post("/black-litterman/optimize")
+async def black_litterman_optimize(request: BlackLittermanRequest):
+    """
+    Perform Black-Litterman portfolio optimization.
+
+    The Black-Litterman model combines market equilibrium returns with investor views
+    to produce optimal portfolio weights. This is a powerful tool for portfolio construction
+    that allows investors to express their beliefs about expected returns while maintaining
+    a well-diversified portfolio.
+
+    Key Concepts:
+    - Prior Returns: Market-implied equilibrium returns derived from market cap weights
+    - Views: Your beliefs about expected returns (absolute or relative)
+    - Posterior Returns: Blended returns after incorporating your views
+    - Optimal Weights: Portfolio weights that maximize Sharpe ratio given posterior returns
+
+    Request body:
+    - tickers: List of ticker symbols (e.g., ["AAPL", "MSFT", "GOOGL"])
+    - start_date: Start date for historical data (YYYY-MM-DD)
+    - end_date: End date for historical data (YYYY-MM-DD)
+    - market_caps: Market capitalizations for each ticker
+    - views: Your investment views (optional)
+        - absolute: Views about single assets (e.g., "AAPL will return 15%")
+        - relative: Views about relative performance (e.g., "GOOGL will outperform MSFT by 3%")
+    - risk_aversion: Risk aversion coefficient (default 2.5, higher = more conservative)
+    - risk_free_rate: Annual risk-free rate (default 0.04 for 4%)
+
+    Returns:
+    - optimal_weights: Recommended portfolio weights
+    - expected_return: Expected annual return of optimal portfolio
+    - expected_risk: Expected annual volatility of optimal portfolio
+    - sharpe_ratio: Sharpe ratio of optimal portfolio
+    - prior_returns: Market equilibrium returns before views
+    - posterior_returns: Expected returns after incorporating views
+    - market_cap_weights: Starting weights based on market capitalization
+    - comparison: Side-by-side comparison of market-weighted vs Black-Litterman portfolio
+    """
+    request_id = str(uuid.uuid4())[:8]
+    start_time = time.time()
+
+    logger.info(f"[{request_id}] === NEW /black-litterman/optimize REQUEST ===")
+    logger.info(f"[{request_id}] Received request at {datetime.now().isoformat()}")
+    logger.info(f"[{request_id}] Tickers: {request.tickers}")
+    logger.info(f"[{request_id}] Date range: {request.start_date} to {request.end_date}")
+    logger.info(f"[{request_id}] Risk aversion: {request.risk_aversion}")
+    logger.info(f"[{request_id}] Risk-free rate: {request.risk_free_rate}")
+
+    try:
+        # Import the black-litterman module
+        from portfolio_tool.black_litterman import run_black_litterman_optimization
+
+        # Validate tickers
+        if not request.tickers or len(request.tickers) < 2:
+            raise HTTPException(
+                status_code=400,
+                detail="At least 2 tickers are required for portfolio optimization"
+            )
+
+        # Normalize tickers
+        tickers = [t.strip().upper() for t in request.tickers]
+        logger.info(f"[{request_id}] Normalized tickers: {tickers}")
+
+        # Validate dates
+        try:
+            start_dt = pd.Timestamp(request.start_date)
+            end_dt = pd.Timestamp(request.end_date)
+        except (ValueError, TypeError) as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid date format. Use YYYY-MM-DD format. Error: {str(e)}"
+            )
+
+        if start_dt >= end_dt:
+            raise HTTPException(
+                status_code=400,
+                detail=f"start_date ({request.start_date}) must be before end_date ({request.end_date})"
+            )
+
+        # Check minimum date range (1 year)
+        date_range_days = (end_dt - start_dt).days
+        if date_range_days < 365:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Date range too short ({date_range_days} days). Minimum 1 year (365 days) required for reliable optimization."
+            )
+
+        # Validate market caps
+        if not request.market_caps:
+            raise HTTPException(
+                status_code=400,
+                detail="market_caps dictionary is required"
+            )
+
+        # Normalize market_caps keys to uppercase
+        market_caps = {k.strip().upper(): v for k, v in request.market_caps.items()}
+
+        # Check that all tickers have market caps
+        missing_caps = set(tickers) - set(market_caps.keys())
+        if missing_caps:
+            logger.warning(f"[{request_id}] Missing market caps for: {missing_caps}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Missing market_caps for tickers: {list(missing_caps)}"
+            )
+
+        # Validate market cap values
+        for ticker, cap in market_caps.items():
+            if cap <= 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Market cap for {ticker} must be positive, got {cap}"
+                )
+
+        # Only keep market caps for requested tickers
+        market_caps = {t: market_caps[t] for t in tickers}
+        logger.info(f"[{request_id}] Market caps: {market_caps}")
+
+        # Process views
+        views = {'absolute': [], 'relative': []}
+        if request.views:
+            # Process absolute views
+            if request.views.absolute:
+                for view in request.views.absolute:
+                    asset = view.asset.strip().upper()
+                    if asset not in tickers:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Asset '{asset}' in absolute view not found in tickers list"
+                        )
+                    if not (0.0 <= view.confidence <= 1.0):
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Confidence for {asset} must be between 0 and 1, got {view.confidence}"
+                        )
+                    if not (-0.50 <= view.return_ <= 0.50):
+                        logger.warning(f"[{request_id}] Unusual expected return for {asset}: {view.return_}")
+
+                    views['absolute'].append({
+                        'asset': asset,
+                        'return': view.return_,
+                        'confidence': view.confidence
+                    })
+
+            # Process relative views
+            if request.views.relative:
+                for view in request.views.relative:
+                    asset1 = view.asset1.strip().upper()
+                    asset2 = view.asset2.strip().upper()
+
+                    if asset1 not in tickers:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Asset '{asset1}' in relative view not found in tickers list"
+                        )
+                    if asset2 not in tickers:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Asset '{asset2}' in relative view not found in tickers list"
+                        )
+                    if asset1 == asset2:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Relative view assets must be different, got {asset1} vs {asset2}"
+                        )
+                    if not (0.0 <= view.confidence <= 1.0):
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Confidence for relative view must be between 0 and 1, got {view.confidence}"
+                        )
+
+                    views['relative'].append({
+                        'asset1': asset1,
+                        'asset2': asset2,
+                        'outperformance': view.outperformance,
+                        'confidence': view.confidence
+                    })
+
+        logger.info(f"[{request_id}] Views: {len(views['absolute'])} absolute, {len(views['relative'])} relative")
+
+        # Validate risk_aversion
+        if request.risk_aversion <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"risk_aversion must be positive, got {request.risk_aversion}"
+            )
+
+        # Validate risk_free_rate
+        if not (0.0 <= request.risk_free_rate <= 0.20):
+            logger.warning(f"[{request_id}] Unusual risk-free rate: {request.risk_free_rate}")
+
+        # Run Black-Litterman optimization
+        logger.info(f"[{request_id}] Starting Black-Litterman optimization...")
+
+        result = run_black_litterman_optimization(
+            tickers=tickers,
+            start_date=request.start_date,
+            end_date=request.end_date,
+            market_caps=market_caps,
+            views=views,
+            risk_aversion=request.risk_aversion,
+            risk_free_rate=request.risk_free_rate,
+            tau=0.05  # Standard uncertainty scalar
+        )
+
+        # Log successful response
+        elapsed_time = time.time() - start_time
+        logger.info(f"[{request_id}] === RESPONSE READY ===")
+        logger.info(f"[{request_id}] Processing time: {elapsed_time:.2f} seconds")
+        logger.info(f"[{request_id}] Optimal Sharpe ratio: {result['sharpe_ratio']:.4f}")
+        logger.info(f"[{request_id}] === END REQUEST [{request_id}] ===")
+
+        return {
+            "success": True,
+            "data": result
+        }
+
+    except HTTPException:
+        raise
+    except ValueError as e:
+        error_msg = str(e)
+        elapsed_time = time.time() - start_time
+        logger.error(f"[{request_id}] ValueError after {elapsed_time:.2f}s: {error_msg}")
+
+        if "no data" in error_msg.lower() or "not found" in error_msg.lower():
+            raise HTTPException(
+                status_code=400,
+                detail=f"Data error: {error_msg}. Please verify ticker symbols and date range."
+            )
+        elif "insufficient" in error_msg.lower():
+            raise HTTPException(
+                status_code=400,
+                detail=f"Insufficient data: {error_msg}. Please use a longer date range."
+            )
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid request: {error_msg}"
+            )
+    except np.linalg.LinAlgError as e:
+        elapsed_time = time.time() - start_time
+        logger.error(f"[{request_id}] Matrix error after {elapsed_time:.2f}s: {str(e)}")
+        raise HTTPException(
+            status_code=400,
+            detail="Matrix computation error. This can happen with highly correlated assets. "
+                   "Try using fewer assets or a longer date range."
+        )
+    except Exception as e:
+        import traceback
+        elapsed_time = time.time() - start_time
+        error_detail = str(e)
+
+        logger.error(f"[{request_id}] === ERROR ===")
+        logger.error(f"[{request_id}] Error after {elapsed_time:.2f} seconds: {error_detail}")
+        logger.error(f"[{request_id}] Error type: {type(e).__name__}")
+        logger.error(f"[{request_id}] Stack trace:\n{traceback.format_exc()}")
+        logger.error(f"[{request_id}] === END ERROR [{request_id}] ===")
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Black-Litterman optimization error: {error_detail}"
         )
 
 

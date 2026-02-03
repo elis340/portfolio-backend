@@ -63,9 +63,10 @@ Back to Lovable frontend for display
 
 ## Key Files
 
-- `api_server.py` - Main FastAPI server (line ~1225: /factors/analyze endpoint)
-- `portfolio_tool/factor_analysis.py` - Core regression analysis logic
+- `api_server.py` - Main FastAPI server with all endpoints
+- `portfolio_tool/factor_analysis.py` - Core factor regression analysis logic
 - `portfolio_tool/fama_french.py` - Fama-French factor data fetcher
+- `portfolio_tool/black_litterman.py` - Black-Litterman portfolio optimization
 - `requirements.txt` - Python dependencies
 
 ## API Endpoints
@@ -147,6 +148,73 @@ Perform Fama-French factor analysis on a single ticker or portfolio.
 **Risk-Free Rates:**
 - `"1M_TBILL"` - 1-Month Treasury Bill (from Fama-French data)
 - `"3M_TBILL"` - 3-Month Treasury Bill
+
+### POST /black-litterman/optimize
+
+Perform Black-Litterman portfolio optimization. Combines market equilibrium returns
+with investor views to produce optimal portfolio weights.
+
+**Request:**
+
+```json
+{
+  "tickers": ["AAPL", "MSFT", "GOOGL", "AMZN"],
+  "start_date": "2020-01-01",
+  "end_date": "2025-01-27",
+  "market_caps": {
+    "AAPL": 2800000000000,
+    "MSFT": 2500000000000,
+    "GOOGL": 1700000000000,
+    "AMZN": 1500000000000
+  },
+  "views": {
+    "absolute": [
+      {"asset": "AAPL", "return": 0.15, "confidence": 0.7}
+    ],
+    "relative": [
+      {"asset1": "GOOGL", "asset2": "MSFT", "outperformance": 0.03, "confidence": 0.5}
+    ]
+  },
+  "risk_aversion": 2.5,
+  "risk_free_rate": 0.04
+}
+```
+
+**Parameters:**
+- `tickers`: List of ticker symbols (minimum 2)
+- `start_date`, `end_date`: Date range for historical data (minimum 1 year)
+- `market_caps`: Market capitalizations in dollars for each ticker
+- `views`: Investor views (optional)
+  - `absolute`: Belief about a single asset's return (e.g., "AAPL will return 15%")
+  - `relative`: Belief about relative performance (e.g., "GOOGL will beat MSFT by 3%")
+- `risk_aversion`: Risk aversion coefficient (default 2.5, higher = more conservative)
+- `risk_free_rate`: Annual risk-free rate (default 0.04)
+
+**Response:**
+
+```json
+{
+  "success": true,
+  "data": {
+    "optimal_weights": {"AAPL": 0.35, "MSFT": 0.25, "GOOGL": 0.20, "AMZN": 0.20},
+    "expected_return": 0.108,
+    "expected_risk": 0.165,
+    "sharpe_ratio": 0.41,
+    "prior_returns": {"AAPL": 0.085, "MSFT": 0.082, "GOOGL": 0.091, "AMZN": 0.098},
+    "posterior_returns": {"AAPL": 0.12, "MSFT": 0.085, "GOOGL": 0.105, "AMZN": 0.098},
+    "market_cap_weights": {"AAPL": 0.34, "MSFT": 0.30, "GOOGL": 0.21, "AMZN": 0.18},
+    "comparison": {
+      "market_weighted": {"return": 0.091, "risk": 0.152, "sharpe": 0.36},
+      "black_litterman": {"return": 0.108, "risk": 0.165, "sharpe": 0.41}
+    }
+  }
+}
+```
+
+**Key Concepts:**
+- **Prior Returns**: Market-implied equilibrium returns (what the market "expects")
+- **Posterior Returns**: Adjusted returns after incorporating your views
+- **Confidence**: How strongly you believe in your view (0 to 1)
 
 **Response includes:**
 - `coefficients` - Factor loadings with t-stats and p-values

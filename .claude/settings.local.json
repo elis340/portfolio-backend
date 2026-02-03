@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(grep:*)",
+      "Bash(git push:*)",
+      "Bash(claude config get:*)",
+      "Bash(this factor\" rather than absolute contribution values.\n\nCo-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>\nEOF\n\\)\")",
+      "Bash(git revert:*)",
+      "Bash(git pull:*)",
+      "WebSearch"
+    ]
+  }
+}
