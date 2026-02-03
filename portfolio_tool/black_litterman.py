@@ -97,28 +97,27 @@ def calculate_returns(prices: pd.DataFrame) -> pd.DataFrame:
 
 
 def calculate_covariance_matrix(
-    returns: pd.DataFrame,
-    method: str = "sample"
-) -> np.ndarray:
+    prices: pd.DataFrame,
+    method: str = "ledoit_wolf"
+) -> pd.DataFrame:
     """
-    Calculate the covariance matrix of returns.
+    Calculate the covariance matrix from price data.
 
     Args:
-        returns: DataFrame of daily returns
-        method: Covariance estimation method ('sample', 'ledoit_wolf', 'shrunk')
+        prices: DataFrame of daily prices
+        method: Covariance estimation method ('sample', 'ledoit_wolf')
 
     Returns:
-        Annualized covariance matrix as numpy array
+        Annualized covariance matrix as DataFrame
     """
+    from pypfopt import risk_models
+
     if method == "ledoit_wolf":
-        from pypfopt import risk_models
-        cov = risk_models.CovarianceShrinkage(returns).ledoit_wolf()
-    elif method == "shrunk":
-        from pypfopt import risk_models
-        cov = risk_models.CovarianceShrinkage(returns).shrunk_covariance()
+        # Ledoit-Wolf shrinkage for more stable covariance estimation
+        cov = risk_models.CovarianceShrinkage(prices).ledoit_wolf()
     else:
-        # Sample covariance, annualized
-        cov = returns.cov() * 252
+        # Sample covariance
+        cov = risk_models.sample_cov(prices)
 
     logger.info(f"Calculated {method} covariance matrix, shape: {cov.shape}")
 
@@ -509,12 +508,8 @@ def run_black_litterman_optimization(
     # 1. Fetch and validate data
     prices = fetch_price_data(tickers, start_date, end_date)
 
-    # 2. Calculate returns and covariance
-    returns = calculate_returns(prices)
-    cov_matrix = calculate_covariance_matrix(returns, method="ledoit_wolf")
-
-    # Convert to DataFrame for easier handling
-    cov_df = pd.DataFrame(cov_matrix, index=tickers, columns=tickers)
+    # 2. Calculate covariance matrix from prices (PyPortfolioOpt handles returns internally)
+    cov_df = calculate_covariance_matrix(prices, method="ledoit_wolf")
 
     # 3. Calculate prior returns (market equilibrium)
     prior_returns = calculate_prior_returns(
