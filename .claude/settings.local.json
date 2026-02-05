@@ -9,7 +9,12 @@
       "Bash(this factor\" rather than absolute contribution values.\n\nCo-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>\nEOF\n\\)\")",
       "Bash(git revert:*)",
       "Bash(git pull:*)",
-      "WebSearch"
+      "WebSearch",
+      "Bash(dir \"C:\\\\Users\\\\andre\\\\Documents\\\\portfolio-backend\\\\portfolio_tool\" /b)",
+      "Bash(python -c:*)",
+      "Bash(pip install:*)",
+      "Bash(python -m uvicorn:*)",
+      "Bash(curl:*)"
     ]
   }
 }

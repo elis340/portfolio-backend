@@ -1,9 +1,15 @@
 """FastAPI server wrapper for Portfolio Analysis backend."""
 
-from fastapi import FastAPI, HTTPException
+import os
+import re
+import traceback
+
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from typing import List, Dict, Optional, Tuple
+from fastapi.responses import JSONResponse
+from starlette.middleware.trustedhost import TrustedHostMiddleware
+from pydantic import BaseModel, Field, field_validator, model_validator
+from typing import List, Dict, Literal, Optional, Tuple
 import pandas as pd
 import numpy as np
 import io
@@ -13,12 +19,34 @@ import uuid
 from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
 
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger("portfolio-api")
+
+
+# --- Rate Limiter Setup ---
+def get_real_client_ip(request: Request) -> str:
+    """Extract real client IP from X-Forwarded-For header (Railway runs behind a proxy)."""
+    forwarded_for = request.headers.get("X-Forwarded-For")
+    if forwarded_for:
+        # X-Forwarded-For can contain multiple IPs: client, proxy1, proxy2
+        # The first one is the real client IP
+        return forwarded_for.split(",")[0].strip()
+    return get_remote_address(request)
+
+
+limiter = Limiter(key_func=get_real_client_ip)
+
+# Ticker validation pattern: 1-10 alphanumeric chars plus dots and hyphens
+_TICKER_PATTERN = re.compile(r'^[A-Za-z0-9.\-]{1,10}$')
+
 
 # Minimum observations required for statistical validity
 MIN_OBSERVATIONS = {
@@ -302,6 +330,7 @@ def compute_annualized_return_and_volatility_from_window(daily_returns, period_y
 from portfolio_tool.data_io import load_portfolio
 from portfolio_tool.market_data import get_price_history, get_sector_info, get_risk_free_rate
 from portfolio_tool.factor_analysis import analyze_factors
+from portfolio_tool.ai_insights import generate_insight
 from portfolio_tool.analytics import (
     compute_returns,
     compute_period_returns,
@@ -334,31 +363,132 @@ from portfolio_tool.analytics import (
     MIN_OBS_SORTINO,
 )
 
+# --- Environment Variables ---
+ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
+APP_VERSION = os.getenv("APP_VERSION", "1.1.0")
+
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "").split(",") if os.getenv("ALLOWED_ORIGINS") else [
+    "http://localhost:3000",
+    "http://localhost:3001",
+    "http://localhost:5173",
+    "http://localhost:5174",
+    "http://localhost:8080",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:3001",
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1:5174",
+    "http://127.0.0.1:8080",
+]
+# Strip whitespace from origins
+ALLOWED_ORIGINS = [o.strip() for o in ALLOWED_ORIGINS if o.strip()]
+
+ALLOWED_HOSTS = os.getenv("ALLOWED_HOSTS", "").split(",") if os.getenv("ALLOWED_HOSTS") else ["*"]
+ALLOWED_HOSTS = [h.strip() for h in ALLOWED_HOSTS if h.strip()]
+
+# --- App Creation ---
 app = FastAPI(
     title="Portfolio Analysis API",
     description="Backend API for portfolio analytics using real market data",
-    version="1.0.0"
+    version=APP_VERSION,
 )
 
-# CORS middleware - allow Next.js frontend
+# Attach rate limiter to app
+app.state.limiter = limiter
+
+
+# --- Custom Rate Limit Exception Handler ---
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_exceeded_handler(request: Request, exc: RateLimitExceeded):
+    retry_after = exc.detail if hasattr(exc, "detail") else "unknown"
+    return JSONResponse(
+        status_code=429,
+        content={
+            "error": "Rate limit exceeded",
+            "retry_after": str(retry_after),
+            "message": "You've made too many requests. Please try again later.",
+        },
+        headers={"Retry-After": str(retry_after)},
+    )
+
+
+# --- Global Exception Handler ---
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    # Let FastAPI handle HTTPExceptions with their proper status codes
+    if isinstance(exc, HTTPException):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": exc.detail},
+        )
+    logger.error(f"Unhandled exception on {request.method} {request.url.path}: {type(exc).__name__}")
+    logger.error(traceback.format_exc())
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "Internal server error",
+            "message": "An unexpected error occurred. Please try again later.",
+        },
+    )
+
+
+# --- Middleware Stack (last added = first executed) ---
+
+# 1. TrustedHostMiddleware
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
+
+# 2. CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://localhost:3001",
-        "http://localhost:5173",  # Vite default port
-        "http://localhost:5174",  # Vite alternate port
-        "http://localhost:8080",  # Current frontend port
-        "http://127.0.0.1:3000",
-        "http://127.0.0.1:3001",
-        "http://127.0.0.1:5173",
-        "http://127.0.0.1:5174",
-        "http://127.0.0.1:8080",
-    ],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=[
+        "X-RateLimit-Limit",
+        "X-RateLimit-Remaining",
+        "X-RateLimit-Reset",
+        "Retry-After",
+    ],
 )
+
+
+# 3. Security Headers Middleware
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Content-Security-Policy"] = "default-src 'self'"
+    if ENVIRONMENT == "production":
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return response
+
+
+# 4. Request Logging Middleware
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    client_ip = get_real_client_ip(request)
+    logger.info(f"Incoming {request.method} {request.url.path} from {client_ip}")
+    start = time.time()
+    response = await call_next(request)
+    elapsed = time.time() - start
+    logger.info(f"Completed {request.method} {request.url.path} -> {response.status_code} in {elapsed:.2f}s")
+    return response
+
+
+# --- Startup Event ---
+@app.on_event("startup")
+async def startup_event():
+    openai_status = "configured" if os.getenv("OPENAI_API_KEY") else "NOT SET"
+    logger.info(f"Starting Portfolio Analysis API v{APP_VERSION}")
+    logger.info(f"Environment: {ENVIRONMENT}")
+    logger.info(f"CORS origins: {len(ALLOWED_ORIGINS)} configured")
+    logger.info(f"Trusted hosts: {ALLOWED_HOSTS}")
+    logger.info(f"OpenAI API key: {openai_status}")
+    if openai_status == "NOT SET":
+        logger.warning("OPENAI_API_KEY not set - AI insights will be disabled")
 
 
 class PortfolioRequest(BaseModel):
@@ -373,12 +503,46 @@ class FactorAnalysisRequest(BaseModel):
     tickers: Optional[List[str]] = None
     weights: Optional[List[float]] = None  # Must sum to 1.0
     # Date range
-    start_date: Optional[str] = None  # ISO format date string (YYYY-MM-DD)
-    end_date: Optional[str] = None  # ISO format date string (YYYY-MM-DD)
+    start_date: Optional[str] = Field(None, pattern=r'^\d{4}-\d{2}-\d{2}$')
+    end_date: Optional[str] = Field(None, pattern=r'^\d{4}-\d{2}-\d{2}$')
     # Analysis parameters
-    factor_model: str = "3-factor"  # Options: "3-factor", "5-factor", "4-factor", "CAPM"
-    frequency: str = "monthly"  # Options: "daily", "weekly", "monthly"
-    risk_free_rate: str = "1M_TBILL"  # Options: "1M_TBILL", "3M_TBILL"
+    factor_model: Literal["CAPM", "3-factor", "4-factor", "5-factor"] = "3-factor"
+    frequency: Literal["daily", "weekly", "monthly"] = "monthly"
+    risk_free_rate: Literal["1M_TBILL", "3M_TBILL"] = "1M_TBILL"
+
+    @field_validator('ticker')
+    @classmethod
+    def validate_ticker(cls, v):
+        if v is not None:
+            v = v.strip().upper()
+            if not _TICKER_PATTERN.match(v):
+                raise ValueError(f"Invalid ticker format: '{v}'. Must be 1-10 alphanumeric characters.")
+        return v
+
+    @field_validator('tickers')
+    @classmethod
+    def validate_tickers(cls, v):
+        if v is not None:
+            if len(v) > 20:
+                raise ValueError("Maximum 20 tickers allowed")
+            validated = []
+            for t in v:
+                t = t.strip().upper()
+                if not _TICKER_PATTERN.match(t):
+                    raise ValueError(f"Invalid ticker format: '{t}'. Must be 1-10 alphanumeric characters.")
+                validated.append(t)
+            return validated
+        return v
+
+    @model_validator(mode='after')
+    def validate_weights_match_tickers(self):
+        if self.tickers and self.weights:
+            if len(self.tickers) != len(self.weights):
+                raise ValueError(f"Number of tickers ({len(self.tickers)}) must match number of weights ({len(self.weights)})")
+            weights_sum = sum(self.weights)
+            if not (0.99 <= weights_sum <= 1.01):
+                raise ValueError(f"Weights must sum to ~1.0, got {weights_sum:.4f}")
+        return self
 
 
 class AbsoluteView(BaseModel):
@@ -387,7 +551,15 @@ class AbsoluteView(BaseModel):
 
     asset: str  # Ticker symbol
     return_: float = Field(alias="return")  # Expected annual return (e.g., 0.15 for 15%)
-    confidence: float  # Confidence in view (0.0 to 1.0)
+    confidence: float = Field(gt=0.0, le=1.0)  # Confidence in view (0.0 to 1.0)
+
+    @field_validator('asset')
+    @classmethod
+    def validate_asset(cls, v):
+        v = v.strip().upper()
+        if not _TICKER_PATTERN.match(v):
+            raise ValueError(f"Invalid asset ticker: '{v}'")
+        return v
 
 
 class RelativeView(BaseModel):
@@ -395,7 +567,15 @@ class RelativeView(BaseModel):
     asset1: str  # Ticker that will outperform
     asset2: str  # Ticker that will underperform
     outperformance: float  # Expected outperformance (e.g., 0.03 for 3%)
-    confidence: float  # Confidence in view (0.0 to 1.0)
+    confidence: float = Field(gt=0.0, le=1.0)  # Confidence in view (0.0 to 1.0)
+
+    @field_validator('asset1', 'asset2')
+    @classmethod
+    def validate_assets(cls, v):
+        v = v.strip().upper()
+        if not _TICKER_PATTERN.match(v):
+            raise ValueError(f"Invalid asset ticker: '{v}'")
+        return v
 
 
 class ViewsInput(BaseModel):
@@ -420,13 +600,77 @@ class BlackLittermanRequest(BaseModel):
         risk_aversion: Risk aversion coefficient (higher = more conservative, default 2.5)
         risk_free_rate: Annual risk-free rate (default 0.04 for 4%)
     """
-    tickers: List[str]
-    start_date: str
-    end_date: str
+    tickers: List[str] = Field(min_length=2, max_length=20)
+    start_date: str = Field(pattern=r'^\d{4}-\d{2}-\d{2}$')
+    end_date: str = Field(pattern=r'^\d{4}-\d{2}-\d{2}$')
     market_caps: Dict[str, float]
     views: Optional[ViewsInput] = None
-    risk_aversion: float = 2.5
-    risk_free_rate: float = 0.04
+    risk_aversion: float = Field(default=2.5, ge=0.1, le=100)
+    risk_free_rate: float = Field(default=0.04, ge=0.0, le=1.0)
+
+    @field_validator('tickers')
+    @classmethod
+    def validate_tickers(cls, v):
+        validated = []
+        for t in v:
+            t = t.strip().upper()
+            if not _TICKER_PATTERN.match(t):
+                raise ValueError(f"Invalid ticker format: '{t}'. Must be 1-10 alphanumeric characters.")
+            validated.append(t)
+        return validated
+
+    @field_validator('market_caps')
+    @classmethod
+    def validate_market_caps(cls, v):
+        for ticker, cap in v.items():
+            if cap <= 0:
+                raise ValueError(f"Market cap for {ticker} must be positive, got {cap}")
+        return v
+
+    @model_validator(mode='after')
+    def validate_dates_and_caps(self):
+        # Validate end_date > start_date
+        try:
+            start_dt = pd.Timestamp(self.start_date)
+            end_dt = pd.Timestamp(self.end_date)
+            if end_dt <= start_dt:
+                raise ValueError(f"end_date ({self.end_date}) must be after start_date ({self.start_date})")
+            date_range_days = (end_dt - start_dt).days
+            if date_range_days < 365:
+                raise ValueError(f"Date range too short ({date_range_days} days). Minimum 1 year required.")
+            if date_range_days > 3652:
+                raise ValueError(f"Date range too long ({date_range_days} days). Maximum ~10 years allowed.")
+        except ValueError:
+            raise
+        # Validate market_caps keys match tickers
+        caps_upper = {k.strip().upper() for k in self.market_caps.keys()}
+        tickers_set = set(self.tickers)
+        missing = tickers_set - caps_upper
+        if missing:
+            raise ValueError(f"Missing market_caps for tickers: {list(missing)}")
+        return self
+
+
+class AIExplainRequest(BaseModel):
+    analysis_type: Literal["performance", "factor_analysis", "black_litterman"]
+    data: dict
+    section: str = Field(..., min_length=1, max_length=50)
+
+    @model_validator(mode='after')
+    def validate_data_size(self):
+        import json
+        # Limit serialized data size to prevent abuse (100KB max)
+        data_str = json.dumps(self.data, default=str)
+        if len(data_str) > 102400:
+            raise ValueError(f"Data payload too large ({len(data_str)} bytes). Maximum 100KB allowed.")
+        return self
+
+
+class AIExplainResponse(BaseModel):
+    insight: str
+    requests_remaining: int
+    cached: bool
+    tokens_used: int
 
 
 def parse_portfolio_text(portfolio_text: str) -> pd.DataFrame:
@@ -466,7 +710,8 @@ def parse_portfolio_text(portfolio_text: str) -> pd.DataFrame:
 
 
 @app.post("/analyze")
-async def analyze_portfolio(request: PortfolioRequest):
+@limiter.limit("100/hour")
+async def analyze_portfolio(request: Request, body: PortfolioRequest):
     """Analyze portfolio and return formatted results matching frontend expectations."""
     request_id = str(uuid.uuid4())[:8]
     start_time = time.time()
@@ -474,17 +719,17 @@ async def analyze_portfolio(request: PortfolioRequest):
     # Log incoming request
     logger.info(f"[{request_id}] === NEW /analyze REQUEST ===")
     logger.info(f"[{request_id}] Received request at {datetime.now().isoformat()}")
-    logger.info(f"[{request_id}] Portfolio text length: {len(request.portfolioText) if request.portfolioText else 0} chars")
-    logger.info(f"[{request_id}] Requested start date: {request.requested_start_date}")
+    logger.info(f"[{request_id}] Portfolio text length: {len(body.portfolioText) if body.portfolioText else 0} chars")
+    logger.info(f"[{request_id}] Requested start date: {body.requested_start_date}")
 
     # Log first 500 chars of portfolio text for debugging (avoid logging huge payloads)
-    portfolio_preview = request.portfolioText[:500] if request.portfolioText else "(empty)"
+    portfolio_preview = body.portfolioText[:500] if body.portfolioText else "(empty)"
     logger.info(f"[{request_id}] Portfolio preview: {portfolio_preview}")
 
     try:
         # Parse portfolio from text
         logger.info(f"[{request_id}] Parsing portfolio text...")
-        portfolio_df = parse_portfolio_text(request.portfolioText)
+        portfolio_df = parse_portfolio_text(body.portfolioText)
         
         tickers = portfolio_df['ticker'].tolist()
         weights = portfolio_df.set_index('ticker')['weight'].to_dict()
@@ -502,9 +747,9 @@ async def analyze_portfolio(request: PortfolioRequest):
         
         # Parse user-selected start date if provided
         user_selected_start_date = None
-        if request.requested_start_date:
+        if body.requested_start_date:
             try:
-                user_selected_start_date = pd.Timestamp(request.requested_start_date)
+                user_selected_start_date = pd.Timestamp(body.requested_start_date)
                 if user_selected_start_date > pd.Timestamp(today):
                     user_selected_start_date = None  # Invalid future date
             except (ValueError, TypeError):
@@ -1186,7 +1431,7 @@ async def analyze_portfolio(request: PortfolioRequest):
             'period_days': period_days,
             'period_years': safe_float(period_years) if period_years else None,
             'number_of_daily_return_rows': n_obs,
-            'user_selected_start_date': request.requested_start_date if request.requested_start_date else None,
+            'user_selected_start_date': body.requested_start_date if body.requested_start_date else None,
             'common_start_date': common_start_date.strftime('%Y-%m-%d') if common_start_date is not None else None,
             'limiting_ticker': limiting_ticker,
             'limiting_start_date': limiting_start_date.strftime('%Y-%m-%d') if limiting_start_date is not None else None,
@@ -1271,7 +1516,7 @@ async def analyze_portfolio(request: PortfolioRequest):
                 'effectiveStartDate': effective_start_date.strftime('%Y-%m-%d') if effective_start_date is not None else None
             },
             'analysisWindow': {
-                'requestedStartDate': request.requested_start_date if request.requested_start_date else None,
+                'requestedStartDate': body.requested_start_date if body.requested_start_date else None,
                 'effectiveStartDate': effective_start_date.strftime('%Y-%m-%d') if effective_start_date is not None else None,
                 'startDateAdjusted': start_date_adjusted,
                 'asOfDate': as_of_date.strftime('%Y-%m-%d') if as_of_date is not None else None,
@@ -1345,7 +1590,8 @@ async def analyze_portfolio(request: PortfolioRequest):
 
 
 @app.post("/factors/analyze")
-async def analyze_factors_endpoint(request: FactorAnalysisRequest):
+@limiter.limit("20/hour")
+async def analyze_factors_endpoint(request: Request, body: FactorAnalysisRequest):
     """
     Perform Fama-French factor analysis on a single ticker.
     
@@ -1370,8 +1616,8 @@ async def analyze_factors_endpoint(request: FactorAnalysisRequest):
     """
     try:
         # Validate ticker/portfolio inputs
-        has_single_ticker = request.ticker and request.ticker.strip()
-        has_portfolio = request.tickers and len(request.tickers) > 0
+        has_single_ticker = body.ticker and body.ticker.strip()
+        has_portfolio = body.tickers and len(body.tickers) > 0
 
         if not has_single_ticker and not has_portfolio:
             raise HTTPException(
@@ -1386,17 +1632,17 @@ async def analyze_factors_endpoint(request: FactorAnalysisRequest):
             )
 
         if has_portfolio:
-            if not request.weights or len(request.weights) == 0:
+            if not body.weights or len(body.weights) == 0:
                 raise HTTPException(
                     status_code=400,
                     detail="Must provide 'weights' when using multiple tickers"
                 )
-            if len(request.tickers) != len(request.weights):
+            if len(body.tickers) != len(body.weights):
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Number of tickers ({len(request.tickers)}) must match number of weights ({len(request.weights)})"
+                    detail=f"Number of tickers ({len(body.tickers)}) must match number of weights ({len(body.weights)})"
                 )
-            weights_sum = sum(request.weights)
+            weights_sum = sum(body.weights)
             if not (0.99 <= weights_sum <= 1.01):
                 raise HTTPException(
                     status_code=400,
@@ -1404,15 +1650,15 @@ async def analyze_factors_endpoint(request: FactorAnalysisRequest):
                 )
 
         # Validate dates
-        if not request.start_date or not request.end_date:
+        if not body.start_date or not body.end_date:
             raise HTTPException(
                 status_code=400,
                 detail="start_date and end_date are required"
             )
 
         try:
-            start_dt = pd.Timestamp(request.start_date)
-            end_dt = pd.Timestamp(request.end_date)
+            start_dt = pd.Timestamp(body.start_date)
+            end_dt = pd.Timestamp(body.end_date)
         except (ValueError, TypeError) as e:
             raise HTTPException(
                 status_code=400,
@@ -1422,65 +1668,65 @@ async def analyze_factors_endpoint(request: FactorAnalysisRequest):
         if start_dt >= end_dt:
             raise HTTPException(
                 status_code=400,
-                detail=f"start_date ({request.start_date}) must be before end_date ({request.end_date})"
+                detail=f"start_date ({body.start_date}) must be before end_date ({body.end_date})"
             )
 
         # Validate factor_model
         valid_models = ["3-factor", "5-factor", "4-factor", "CAPM"]
-        if request.factor_model not in valid_models:
+        if body.factor_model not in valid_models:
             raise HTTPException(
                 status_code=400,
-                detail=f"factor_model must be one of {valid_models}. Got: {request.factor_model}"
+                detail=f"factor_model must be one of {valid_models}. Got: {body.factor_model}"
             )
 
         # Validate frequency
         valid_frequencies = ["daily", "weekly", "monthly"]
-        if request.frequency not in valid_frequencies:
+        if body.frequency not in valid_frequencies:
             raise HTTPException(
                 status_code=400,
-                detail=f"frequency must be one of {valid_frequencies}. Got: {request.frequency}"
+                detail=f"frequency must be one of {valid_frequencies}. Got: {body.frequency}"
             )
 
         # Validate risk_free_rate
         valid_rf_rates = ["1M_TBILL", "3M_TBILL"]
-        if request.risk_free_rate not in valid_rf_rates:
+        if body.risk_free_rate not in valid_rf_rates:
             raise HTTPException(
                 status_code=400,
-                detail=f"risk_free_rate must be one of {valid_rf_rates}. Got: {request.risk_free_rate}"
+                detail=f"risk_free_rate must be one of {valid_rf_rates}. Got: {body.risk_free_rate}"
             )
 
         # Adjust dates to ensure minimum observations
         adjusted_start_date, adjusted_end_date, was_adjusted, adjustment_message = calculate_adjusted_dates(
-            request.start_date,
-            request.end_date,
-            request.frequency
+            body.start_date,
+            body.end_date,
+            body.frequency
         )
 
         # Call the factor analysis function with adjusted dates
         if has_single_ticker:
             result = analyze_factors(
-                ticker=request.ticker.strip().upper(),
+                ticker=body.ticker.strip().upper(),
                 start_date=adjusted_start_date,
                 end_date=adjusted_end_date,
-                factor_model=request.factor_model,
-                frequency=request.frequency,
-                risk_free_rate=request.risk_free_rate
+                factor_model=body.factor_model,
+                frequency=body.frequency,
+                risk_free_rate=body.risk_free_rate
             )
         else:
             result = analyze_factors(
-                tickers=[t.strip().upper() for t in request.tickers],
-                weights=request.weights,
+                tickers=[t.strip().upper() for t in body.tickers],
+                weights=body.weights,
                 start_date=adjusted_start_date,
                 end_date=adjusted_end_date,
-                factor_model=request.factor_model,
-                frequency=request.frequency,
-                risk_free_rate=request.risk_free_rate
+                factor_model=body.factor_model,
+                frequency=body.frequency,
+                risk_free_rate=body.risk_free_rate
             )
 
         # Add date adjustment info to response
         if was_adjusted:
-            result['period']['requested_start'] = request.start_date
-            result['period']['requested_end'] = request.end_date
+            result['period']['requested_start'] = body.start_date
+            result['period']['requested_end'] = body.end_date
             result['period']['was_adjusted'] = True
             result['period']['adjustment_reason'] = adjustment_message
         else:
@@ -1500,7 +1746,7 @@ async def analyze_factors_endpoint(request: FactorAnalysisRequest):
         if "ticker" in error_msg.lower() and ("not found" in error_msg.lower() or "no data" in error_msg.lower()):
             raise HTTPException(
                 status_code=400,
-                detail=f"Ticker '{request.ticker}' not found or no data available. "
+                detail=f"Ticker '{body.ticker}' not found or no data available. "
                        f"Please verify the ticker symbol is correct and has data for the specified date range."
             )
         elif "insufficient" in error_msg.lower() or "need at least" in error_msg.lower():
@@ -1557,7 +1803,8 @@ async def analyze_factors_endpoint(request: FactorAnalysisRequest):
 
 
 @app.post("/black-litterman/optimize")
-async def black_litterman_optimize(request: BlackLittermanRequest):
+@limiter.limit("10/hour")
+async def black_litterman_optimize(request: Request, body: BlackLittermanRequest):
     """
     Perform Black-Litterman portfolio optimization.
 
@@ -1598,30 +1845,30 @@ async def black_litterman_optimize(request: BlackLittermanRequest):
 
     logger.info(f"[{request_id}] === NEW /black-litterman/optimize REQUEST ===")
     logger.info(f"[{request_id}] Received request at {datetime.now().isoformat()}")
-    logger.info(f"[{request_id}] Tickers: {request.tickers}")
-    logger.info(f"[{request_id}] Date range: {request.start_date} to {request.end_date}")
-    logger.info(f"[{request_id}] Risk aversion: {request.risk_aversion}")
-    logger.info(f"[{request_id}] Risk-free rate: {request.risk_free_rate}")
+    logger.info(f"[{request_id}] Tickers: {body.tickers}")
+    logger.info(f"[{request_id}] Date range: {body.start_date} to {body.end_date}")
+    logger.info(f"[{request_id}] Risk aversion: {body.risk_aversion}")
+    logger.info(f"[{request_id}] Risk-free rate: {body.risk_free_rate}")
 
     try:
         # Import the black-litterman module
         from portfolio_tool.black_litterman import run_black_litterman_optimization
 
         # Validate tickers
-        if not request.tickers or len(request.tickers) < 2:
+        if not body.tickers or len(body.tickers) < 2:
             raise HTTPException(
                 status_code=400,
                 detail="At least 2 tickers are required for portfolio optimization"
             )
 
         # Normalize tickers
-        tickers = [t.strip().upper() for t in request.tickers]
+        tickers = [t.strip().upper() for t in body.tickers]
         logger.info(f"[{request_id}] Normalized tickers: {tickers}")
 
         # Validate dates
         try:
-            start_dt = pd.Timestamp(request.start_date)
-            end_dt = pd.Timestamp(request.end_date)
+            start_dt = pd.Timestamp(body.start_date)
+            end_dt = pd.Timestamp(body.end_date)
         except (ValueError, TypeError) as e:
             raise HTTPException(
                 status_code=400,
@@ -1631,7 +1878,7 @@ async def black_litterman_optimize(request: BlackLittermanRequest):
         if start_dt >= end_dt:
             raise HTTPException(
                 status_code=400,
-                detail=f"start_date ({request.start_date}) must be before end_date ({request.end_date})"
+                detail=f"start_date ({body.start_date}) must be before end_date ({body.end_date})"
             )
 
         # Check minimum date range (1 year)
@@ -1643,14 +1890,14 @@ async def black_litterman_optimize(request: BlackLittermanRequest):
             )
 
         # Validate market caps
-        if not request.market_caps:
+        if not body.market_caps:
             raise HTTPException(
                 status_code=400,
                 detail="market_caps dictionary is required"
             )
 
         # Normalize market_caps keys to uppercase
-        market_caps = {k.strip().upper(): v for k, v in request.market_caps.items()}
+        market_caps = {k.strip().upper(): v for k, v in body.market_caps.items()}
 
         # Check that all tickers have market caps
         missing_caps = set(tickers) - set(market_caps.keys())
@@ -1675,10 +1922,10 @@ async def black_litterman_optimize(request: BlackLittermanRequest):
 
         # Process views
         views = {'absolute': [], 'relative': []}
-        if request.views:
+        if body.views:
             # Process absolute views
-            if request.views.absolute:
-                for view in request.views.absolute:
+            if body.views.absolute:
+                for view in body.views.absolute:
                     asset = view.asset.strip().upper()
                     if asset not in tickers:
                         raise HTTPException(
@@ -1700,8 +1947,8 @@ async def black_litterman_optimize(request: BlackLittermanRequest):
                     })
 
             # Process relative views
-            if request.views.relative:
-                for view in request.views.relative:
+            if body.views.relative:
+                for view in body.views.relative:
                     asset1 = view.asset1.strip().upper()
                     asset2 = view.asset2.strip().upper()
 
@@ -1736,27 +1983,27 @@ async def black_litterman_optimize(request: BlackLittermanRequest):
         logger.info(f"[{request_id}] Views: {len(views['absolute'])} absolute, {len(views['relative'])} relative")
 
         # Validate risk_aversion
-        if request.risk_aversion <= 0:
+        if body.risk_aversion <= 0:
             raise HTTPException(
                 status_code=400,
-                detail=f"risk_aversion must be positive, got {request.risk_aversion}"
+                detail=f"risk_aversion must be positive, got {body.risk_aversion}"
             )
 
         # Validate risk_free_rate
-        if not (0.0 <= request.risk_free_rate <= 0.20):
-            logger.warning(f"[{request_id}] Unusual risk-free rate: {request.risk_free_rate}")
+        if not (0.0 <= body.risk_free_rate <= 0.20):
+            logger.warning(f"[{request_id}] Unusual risk-free rate: {body.risk_free_rate}")
 
         # Run Black-Litterman optimization
         logger.info(f"[{request_id}] Starting Black-Litterman optimization...")
 
         result = run_black_litterman_optimization(
             tickers=tickers,
-            start_date=request.start_date,
-            end_date=request.end_date,
+            start_date=body.start_date,
+            end_date=body.end_date,
             market_caps=market_caps,
             views=views,
-            risk_aversion=request.risk_aversion,
-            risk_free_rate=request.risk_free_rate,
+            risk_aversion=body.risk_aversion,
+            risk_free_rate=body.risk_free_rate,
             tau=0.05  # Standard uncertainty scalar
         )
 
@@ -1819,10 +2066,39 @@ async def black_litterman_optimize(request: BlackLittermanRequest):
         )
 
 
+@app.post("/ai/explain", response_model=AIExplainResponse)
+@limiter.limit("20/hour")
+async def explain_analysis(request: Request, body: AIExplainRequest):
+    """
+    Generate AI-powered insights for portfolio analysis results.
+
+    Accepts analysis data (performance, factor analysis, or Black-Litterman)
+    and returns a natural-language explanation powered by GPT-4o-mini.
+    Results are cached for 5 minutes to reduce API costs.
+    """
+    # Placeholder user_id until auth is integrated
+    user_id = "test_user"
+
+    result = await generate_insight(
+        analysis_type=body.analysis_type,
+        data=body.data,
+        section=body.section,
+        user_id=user_id,
+    )
+
+    return result
+
+
 @app.get("/health")
 async def health():
     """Health check endpoint."""
-    return {"status": "ok", "service": "portfolio-analysis-api"}
+    return {
+        "status": "ok",
+        "service": "portfolio-analysis-api",
+        "version": APP_VERSION,
+        "environment": ENVIRONMENT,
+        "openai_configured": bool(os.getenv("OPENAI_API_KEY")),
+    }
 
 
 if __name__ == "__main__":
