@@ -658,7 +658,7 @@ class BlackLittermanRequest(BaseModel):
 
 
 class AIExplainRequest(BaseModel):
-    analysis_type: Literal["performance", "factor_analysis", "black_litterman"]
+    analysis_type: Literal["performance", "factor_analysis", "black_litterman", "risk", "frontier"]
     data: dict
     section: str = Field(..., min_length=1, max_length=50)
 

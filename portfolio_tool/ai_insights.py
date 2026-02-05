@@ -29,6 +29,16 @@ SYSTEM_PROMPTS = {
         "understand why certain assets were weighted as they were, how their views influenced "
         "the outcome, and whether the optimized portfolio meets their goals. Keep under 200 words."
     ),
+    "risk": (
+        "You are a risk analyst explaining portfolio risk metrics to retail investors. "
+        "Focus on volatility, beta, drawdowns, and risk contributions. Explain what the numbers "
+        "mean in practical terms and whether the risk level is appropriate. Keep under 200 words."
+    ),
+    "frontier": (
+        "You are explaining efficient frontier analysis results. Help the user understand "
+        "where their portfolio sits relative to the optimal frontier, what trade-offs they're making, "
+        "and whether they could achieve better risk-adjusted returns. Keep under 200 words."
+    ),
 }
 
 # Section-specific user prompt templates
@@ -163,7 +173,7 @@ async def generate_insight(
 
     try:
         response = await client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-5-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
