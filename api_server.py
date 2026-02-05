@@ -383,6 +383,9 @@ ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "").split(",") if os.getenv("ALLO
     "https://preview--portfoliolab.lovable.app",
     "https://qfwfsyfojyxwvdtjjkkh.supabase.co",
     "https://qfwfsyfojyxwvdtjjkkh.functions.supabase.co",
+    # Lovable preview URLs
+    "https://7b6bb500-774a-4df3-8581-940d89947809.lovableproject.com",
+    "https://id-preview--7b6bb500-774a-4df3-8581-940d89947809.lovable.app",
 ]
 # Strip whitespace from origins
 ALLOWED_ORIGINS = [o.strip() for o in ALLOWED_ORIGINS if o.strip()]
