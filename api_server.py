@@ -378,6 +378,11 @@ ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "").split(",") if os.getenv("ALLO
     "http://127.0.0.1:5173",
     "http://127.0.0.1:5174",
     "http://127.0.0.1:8080",
+    # Production origins
+    "https://portfoliolab.lovable.app",
+    "https://preview--portfoliolab.lovable.app",
+    "https://qfwfsyfojyxwvdtjjkkh.supabase.co",
+    "https://qfwfsyfojyxwvdtjjkkh.functions.supabase.co",
 ]
 # Strip whitespace from origins
 ALLOWED_ORIGINS = [o.strip() for o in ALLOWED_ORIGINS if o.strip()]
@@ -440,6 +445,7 @@ app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=r"https://.*\.(lovable\.app|supabase\.co)",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
