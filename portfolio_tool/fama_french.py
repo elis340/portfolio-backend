@@ -270,6 +270,10 @@ def get_factors(start_date, end_date, _version=2, include_5_factor=True, include
                 # Use 'ME' for month-end
                 tbill_3m_monthly = tbill_3m.resample('ME').last()
 
+                # Normalize to start-of-month to match factors_df index
+                # (factors_df uses PeriodIndex.to_timestamp() which gives start-of-month)
+                tbill_3m_monthly.index = tbill_3m_monthly.index.to_period('M').to_timestamp()
+
                 # Convert from annual percentage to monthly decimal
                 # DTB3 is annualized rate (e.g., 4.5%), convert to monthly decimal
                 # Formula: (1 + annual_rate/100)^(1/12) - 1

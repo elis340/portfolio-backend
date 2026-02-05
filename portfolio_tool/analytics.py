@@ -1297,34 +1297,16 @@ def compute_rolling_beta(portfolio_prices, benchmark_prices, portfolio_weights, 
     portfolio_ret_aligned = aligned_df['portfolio']
     bench_ret_aligned = aligned_df['benchmark']
     
-    # Compute rolling beta using vectorized pandas operations (NO for-loops)
-    WINDOW = window_days
+    # Compute rolling beta using pandas built-in rolling covariance/variance
     min_periods = window_days
-    
-    # Compute rolling covariance using vectorized operations
-    # Formula: cov(x,y) = mean((x - mean(x)) * (y - mean(y)))
-    # For sample covariance, we use: sum((x-mean(x))*(y-mean(y))) / (n-1)
-    portfolio_mean = portfolio_ret_aligned.rolling(WINDOW, min_periods=min_periods).mean()
-    bench_mean = bench_ret_aligned.rolling(WINDOW, min_periods=min_periods).mean()
-    
-    # Compute product of deviations from their respective rolling means
-    deviations_product = (portfolio_ret_aligned - portfolio_mean) * (bench_ret_aligned - bench_mean)
-    
-    # Compute rolling mean of deviations product (population covariance)
-    cov_pop = deviations_product.rolling(WINDOW, min_periods=min_periods).mean()
-    
-    # Convert to sample covariance: multiply by n/(n-1)
-    n_effective = portfolio_ret_aligned.rolling(WINDOW, min_periods=min_periods).count()
-    cov = cov_pop * (n_effective / (n_effective - 1)).fillna(1.0)
-    
-    # Compute rolling variance of benchmark (sample variance, ddof=1)
-    var = bench_ret_aligned.rolling(WINDOW, min_periods=min_periods).var(ddof=1)
-    
-    # Compute beta = cov / var with epsilon guard (var.abs() > 1e-12) to avoid divide-by-zero
+
+    rolling_cov = portfolio_ret_aligned.rolling(window_days, min_periods=min_periods).cov(bench_ret_aligned)
+    rolling_var = bench_ret_aligned.rolling(window_days, min_periods=min_periods).var()
+
+    # Beta = cov / var with epsilon guard to avoid divide-by-zero
     epsilon = 1e-12
-    beta = cov / var.where(var.abs() > epsilon, np.nan)
-    
-    # Return beta.dropna() as a Series indexed by date (no backfill/fill missing values)
+    beta = rolling_cov / rolling_var.where(rolling_var.abs() > epsilon, np.nan)
+
     return beta.dropna()
 
 def compute_drawdown_series(cumulative_index):
@@ -1837,10 +1819,10 @@ def compute_efficient_frontier_analysis(portfolio_prices, portfolio_weights, ben
     else:
         invested_ret, invested_vol = 0.0, 0.0
     
-    # Portfolio return including cash: (1 - cash_weight) * invested_ret + cash_weight * 0.0
-    port_ret = invested_ret * (1 - cash_weight)
-    # Portfolio volatility including cash: (1 - cash_weight) * invested_vol (cash has 0 vol, 0 correlation)
-    port_vol = invested_vol * (1 - cash_weight)
+    # Portfolio return/vol including cash: w_invested already sums to (1 - cash_weight),
+    # so invested_ret and invested_vol already reflect the cash drag.
+    port_ret = invested_ret
+    port_vol = invested_vol
     
     portfolio_point = {'vol': port_vol, 'ret': port_ret}
     
