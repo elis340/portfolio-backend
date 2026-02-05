@@ -666,6 +666,21 @@ class AIExplainRequest(BaseModel):
         return self
 
 
+class MarketCapsRequest(BaseModel):
+    tickers: List[str] = Field(min_length=1, max_length=20)
+
+    @field_validator('tickers')
+    @classmethod
+    def validate_tickers(cls, v):
+        validated = []
+        for t in v:
+            t = t.strip().upper()
+            if not _TICKER_PATTERN.match(t):
+                raise ValueError(f"Invalid ticker format: '{t}'. Must be 1-10 alphanumeric characters.")
+            validated.append(t)
+        return validated
+
+
 class AIExplainResponse(BaseModel):
     insight: str
     requests_remaining: int
@@ -2064,6 +2079,52 @@ async def black_litterman_optimize(request: Request, body: BlackLittermanRequest
             status_code=500,
             detail=f"Black-Litterman optimization error: {error_detail}"
         )
+
+
+@app.post("/market-caps")
+@limiter.limit("50/hour")
+async def get_market_caps(request: Request, body: MarketCapsRequest):
+    """
+    Fetch current market capitalizations for a list of tickers.
+
+    Used by the Black-Litterman page to auto-populate market cap inputs.
+    Returns partial results — tickers that fail are silently omitted.
+    """
+    import yfinance as yf
+
+    request_id = str(uuid.uuid4())[:8]
+    start_time = time.time()
+
+    logger.info(f"[{request_id}] === NEW /market-caps REQUEST ===")
+    logger.info(f"[{request_id}] Tickers: {body.tickers}")
+
+    market_caps = {}
+    for ticker_symbol in body.tickers:
+        try:
+            ticker_obj = yf.Ticker(ticker_symbol)
+            info = ticker_obj.info
+
+            cap = info.get("marketCap")
+
+            # Fallback: compute from sharesOutstanding * currentPrice
+            if not cap:
+                shares = info.get("sharesOutstanding")
+                price = info.get("currentPrice") or info.get("regularMarketPrice")
+                if shares and price:
+                    cap = shares * price
+
+            if cap and cap > 0:
+                market_caps[ticker_symbol] = cap
+                logger.info(f"[{request_id}] {ticker_symbol}: ${cap:,.0f}")
+            else:
+                logger.warning(f"[{request_id}] {ticker_symbol}: no market cap data available")
+        except Exception as e:
+            logger.warning(f"[{request_id}] {ticker_symbol}: failed to fetch market cap: {e}")
+
+    elapsed_time = time.time() - start_time
+    logger.info(f"[{request_id}] Returning {len(market_caps)}/{len(body.tickers)} market caps in {elapsed_time:.2f}s")
+
+    return {"market_caps": market_caps}
 
 
 @app.post("/ai/explain", response_model=AIExplainResponse)
