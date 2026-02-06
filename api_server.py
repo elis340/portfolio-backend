@@ -1695,6 +1695,21 @@ async def analyze_factors_endpoint(request: Request, body: FactorAnalysisRequest
                 detail=f"start_date ({body.start_date}) must be before end_date ({body.end_date})"
             )
 
+        # Ensure minimum 36 months of data for monthly frequency
+        MIN_MONTHS = 36
+        start_date = body.start_date
+        end_date = body.end_date
+        try:
+            months_diff = (end_dt.year - start_dt.year) * 12 + (end_dt.month - start_dt.month)
+
+            if months_diff < MIN_MONTHS and body.frequency == "monthly":
+                # Extend start date backwards to get minimum required months
+                extended_start_dt = end_dt - relativedelta(months=MIN_MONTHS + 1)
+                start_date = extended_start_dt.strftime("%Y-%m-%d")
+                logger.info(f"Extended start_date to {start_date} to ensure {MIN_MONTHS} months of data")
+        except Exception as e:
+            logger.warning(f"Date adjustment failed: {e}")
+
         # Validate factor_model
         valid_models = ["3-factor", "5-factor", "4-factor", "CAPM"]
         if body.factor_model not in valid_models:
@@ -1721,8 +1736,8 @@ async def analyze_factors_endpoint(request: Request, body: FactorAnalysisRequest
 
         # Adjust dates to ensure minimum observations
         adjusted_start_date, adjusted_end_date, was_adjusted, adjustment_message = calculate_adjusted_dates(
-            body.start_date,
-            body.end_date,
+            start_date,
+            end_date,
             body.frequency
         )
 
