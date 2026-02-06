@@ -179,7 +179,6 @@ async def generate_insight(
                 {"role": "user", "content": user_prompt},
             ],
             max_completion_tokens=300,
-            temperature=0.7,
         )
 
         insight = response.choices[0].message.content
