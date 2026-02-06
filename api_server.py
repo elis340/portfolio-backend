@@ -734,7 +734,7 @@ def parse_portfolio_text(portfolio_text: str) -> pd.DataFrame:
 
 
 @app.post("/analyze")
-@limiter.limit("100/hour")
+# @limiter.limit("100/hour")  # DISABLED FOR LAUNCH
 async def analyze_portfolio(request: Request, body: PortfolioRequest):
     """Analyze portfolio and return formatted results matching frontend expectations."""
     request_id = str(uuid.uuid4())[:8]
@@ -1614,7 +1614,7 @@ async def analyze_portfolio(request: Request, body: PortfolioRequest):
 
 
 @app.post("/factors/analyze")
-@limiter.limit("20/hour")
+# @limiter.limit("20/hour")  # DISABLED FOR LAUNCH
 async def analyze_factors_endpoint(request: Request, body: FactorAnalysisRequest):
     """
     Perform Fama-French factor analysis on a single ticker.
@@ -1842,7 +1842,7 @@ async def analyze_factors_endpoint(request: Request, body: FactorAnalysisRequest
 
 
 @app.post("/black-litterman/optimize")
-@limiter.limit("10/hour")
+# @limiter.limit("10/hour")  # DISABLED FOR LAUNCH
 async def black_litterman_optimize(request: Request, body: BlackLittermanRequest):
     """
     Perform Black-Litterman portfolio optimization.
@@ -2106,7 +2106,7 @@ async def black_litterman_optimize(request: Request, body: BlackLittermanRequest
 
 
 @app.post("/market-caps")
-@limiter.limit("50/hour")
+# @limiter.limit("50/hour")  # DISABLED FOR LAUNCH
 async def get_market_caps(request: Request, body: MarketCapsRequest):
     """
     Fetch current market capitalizations for a list of tickers.
@@ -2152,7 +2152,7 @@ async def get_market_caps(request: Request, body: MarketCapsRequest):
 
 
 @app.post("/ai/explain", response_model=AIExplainResponse)
-@limiter.limit("20/hour")
+# @limiter.limit("20/hour")  # DISABLED FOR LAUNCH
 async def explain_analysis(request: Request, body: AIExplainRequest):
     """
     Generate AI-powered insights for portfolio analysis results.
