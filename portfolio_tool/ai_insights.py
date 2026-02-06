@@ -178,7 +178,7 @@ async def generate_insight(
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            max_tokens=300,
+            max_completion_tokens=300,
             temperature=0.7,
         )
 
